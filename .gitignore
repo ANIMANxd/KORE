@@ -1,0 +1,36 @@
+provider.config.yaml
+
+venv/
+.env
+testing.py
+AGENTS.md
+data/
+rules/
+
+# IDE and Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+dist/
+build/
+*.egg-info/
+.pytest_cache/
+.coverage
+
+# Logs
+*.log
+
+# OS
+Thumbs.db
+.project
+.pydevproject

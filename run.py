@@ -1,0 +1,547 @@
+import os
+import time
+from collections import Counter
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+import click
+import yaml
+from rich.console import Console
+from rich.panel import Panel
+from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
+from rich.table import Table
+
+# Ensure .env loaded
+from dotenv import load_dotenv
+load_dotenv()
+
+from engine.graph import run_extraction
+from ingestion.chunker import chunk_documents
+from ingestion.loader import load_slack_export
+from output.schema import BusinessRule
+from output.writer import load_rules, save_rule
+from providers.config import ProviderConfig, get_config, load_config
+from providers.embedder import embed_text
+from providers.llm import test_connection
+from providers.registry import get_provider, list_providers
+from storage.vector_store import _connect, init_db, store_chunks
+
+console = Console()
+
+# ---------------------------------------------------------------------------
+# Global verbose flag
+# ---------------------------------------------------------------------------
+
+_VERBOSE = False
+
+
+def _debug(msg: str) -> None:
+    if _VERBOSE:
+        console.print(f"[dim][DEBUG] {msg}[/dim]")
+
+
+# ---------------------------------------------------------------------------
+# CLI group with verbose option
+# ---------------------------------------------------------------------------
+
+@click.group()
+@click.option("--verbose", is_flag=True, help="Enable debug logging")
+@click.pass_context
+def cli(ctx: click.Context, verbose: bool):
+    """KORE - On-Premise Context Engine"""
+    global _VERBOSE
+    _VERBOSE = verbose
+    ctx.ensure_object(dict)
+    ctx.obj["verbose"] = verbose
+
+
+# ---------------------------------------------------------------------------
+# Helpers reused across commands
+# ---------------------------------------------------------------------------
+
+def _pick_provider(prompt_text: str, provider_type: str | None = None) -> tuple[str, str]:
+    providers = list_providers(provider_type)
+
+    table = Table(title=prompt_text)
+    table.add_column("#", style="cyan", justify="right")
+    table.add_column("Provider", style="magenta")
+    table.add_column("Type", style="green")
+    table.add_column("Notes", style="yellow")
+
+    for i, name in enumerate(providers, 1):
+        spec = get_provider(name)
+        notes = []
+        if spec.requires_api_key:
+            notes.append("requires API key")
+        if spec.requires_base_url:
+            if spec.default_base_url:
+                notes.append(f"base URL (default: {spec.default_base_url})")
+            else:
+                notes.append("requires base URL")
+        if not spec.embedding_supported:
+            notes.append("embedding not supported")
+        table.add_row(str(i), name, spec.provider_type, "; ".join(notes) or "–")
+
+    console.print(table)
+
+    while True:
+        choice = click.prompt("Select provider by number", type=int)
+        if 1 <= choice <= len(providers):
+            selected = providers[choice - 1]
+            break
+        console.print("[red]Invalid choice. Try again.[/red]")
+
+    spec = get_provider(selected)
+    console.print(f"\n[bold]{selected}[/bold] — {spec.model_name_hint}\n")
+    model = click.prompt("Enter your model name exactly as your provider specifies it")
+    return selected, model
+
+
+def _ask_api_key(provider_name: str) -> str | None:
+    spec = get_provider(provider_name)
+    if spec.provider_type == "local":
+        return None
+    key = click.prompt("API key", hide_input=True)
+    return key if key else None
+
+
+def _ask_base_url(provider_name: str) -> str | None:
+    spec = get_provider(provider_name)
+    if spec.provider_type == "cloud" and not spec.requires_base_url:
+        return None
+    default = spec.default_base_url
+    if default:
+        url = click.prompt("Base URL", default=default, show_default=True)
+    else:
+        url = click.prompt("Base URL")
+    return url if url else None
+
+
+# ---------------------------------------------------------------------------
+# setup
+# ---------------------------------------------------------------------------
+
+@cli.command()
+def setup():
+    """Interactive setup for provider.config.yaml"""
+    config_path = Path("provider.config.yaml")
+
+    if config_path.exists():
+        if not click.confirm("Config found. Overwrite?"):
+            console.print("[yellow]Setup cancelled.[/yellow]")
+            return
+
+    console.print(Panel.fit("KORE Provider Setup", style="bold blue"))
+
+    # Step 1 — Deployment mode
+    console.print("\n[bold]Step 1 — Deployment mode[/bold]")
+    mode = click.prompt(
+        "Choose mode",
+        type=click.Choice(["cloud", "local", "hybrid"], case_sensitive=False),
+        show_choices=True,
+    )
+
+    # Step 2 — LLM provider
+    console.print("\n[bold]Step 2 — LLM provider[/bold]")
+    llm_provider, llm_model = _pick_provider("Available LLM providers")
+    llm_api_key = _ask_api_key(llm_provider)
+    llm_base_url = _ask_base_url(llm_provider)
+    llm_temperature = click.prompt("Temperature", type=float, default=0.1)
+
+    # Step 5 — Embedding provider
+    console.print("\n[bold]Step 5 — Embedding provider[/bold]")
+    emb_provider, emb_model = _pick_provider("Available embedding providers")
+    emb_api_key = _ask_api_key(emb_provider)
+    emb_base_url = _ask_base_url(emb_provider)
+    emb_dimensions = click.prompt(
+        "Enter the output dimensions for this embedding model\n"
+        "(check your provider's docs — common values: 768, 1024, 1536, 3072)",
+        type=int,
+    )
+
+    # Build temporary config for testing
+    temp_config = ProviderConfig(
+        llm_provider=llm_provider,
+        llm_model=llm_model,
+        llm_api_key=llm_api_key,
+        llm_base_url=llm_base_url,
+        llm_temperature=llm_temperature,
+        embedding_provider=emb_provider,
+        embedding_model=emb_model,
+        embedding_api_key=emb_api_key,
+        embedding_base_url=emb_base_url,
+        embedding_dimensions=emb_dimensions,
+        deployment_mode=mode,
+    )
+
+    # Step 6 — Test connections
+    console.print("\n[bold]Step 6 — Test connections[/bold]")
+
+    with console.status("[bold green]Testing LLM connection..."):
+        llm_ok = test_connection(temp_config)
+
+    if llm_ok:
+        console.print("  LLM connection       [green]✓[/green]")
+    else:
+        console.print("  LLM connection       [red]✗[/red]")
+
+    with console.status("[bold green]Testing embedding connection..."):
+        try:
+            emb_vec = embed_text("hello", config=temp_config)
+            emb_ok = True
+            emb_dims = len(emb_vec)
+        except Exception as exc:
+            emb_ok = False
+            emb_dims = None
+            console.print(f"  [dim]{exc}[/dim]")
+
+    if emb_ok:
+        console.print(f"  Embedding connection [green]✓[/green] ({emb_dims} dimensions)")
+    else:
+        console.print("  Embedding connection [red]✗[/red]")
+
+    # Step 7 — Save
+    console.print("\n[bold]Step 7 — Save configuration[/bold]")
+
+    config_dict = {
+        "llm": {
+            "provider": llm_provider,
+            "model": llm_model,
+            "api_key": llm_api_key,
+            "base_url": llm_base_url,
+            "temperature": llm_temperature,
+        },
+        "embedding": {
+            "provider": emb_provider,
+            "model": emb_model,
+            "api_key": emb_api_key,
+            "base_url": emb_base_url,
+            "dimensions": emb_dimensions,
+        },
+        "deployment_mode": mode,
+    }
+
+    header = (
+        "# provider.config.yaml\n"
+        "# Consult your provider's documentation for the latest available model names.\n"
+        "# This codebase does not restrict or suggest specific models.\n\n"
+    )
+    config_path.write_text(header + yaml.safe_dump(config_dict, sort_keys=False), encoding="utf-8")
+
+    gitignore = Path(".gitignore")
+    entry = "provider.config.yaml\n"
+    if gitignore.exists():
+        current = gitignore.read_text(encoding="utf-8")
+        if "provider.config.yaml" not in current:
+            with open(gitignore, "a", encoding="utf-8") as f:
+                if not current.endswith("\n"):
+                    f.write("\n")
+                f.write(entry)
+    else:
+        gitignore.write_text(entry, encoding="utf-8")
+
+    console.print(
+        "\n[bold green]Setup complete.[/bold green] "
+        "Run [bold]python run.py status[/bold] to verify."
+    )
+
+
+# ---------------------------------------------------------------------------
+# ingest
+# ---------------------------------------------------------------------------
+
+@cli.command()
+@click.option("--source", "source_type", type=click.Choice(["slack"], case_sensitive=False),
+              required=True, help="Data source type")
+@click.option("--path", required=True, help="Path to export directory")
+def ingest(source_type: str, path: str):
+    """Ingest data: load → chunk → embed → store"""
+    start = time.time()
+
+    if source_type != "slack":
+        console.print(f"[red]Source '{source_type}' not yet implemented. Only 'slack' is supported in Phase 1.[/red]")
+        return
+
+    console.print(Panel.fit(f"Ingesting {source_type} data from {path}", style="bold blue"))
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        console=console,
+    ) as progress:
+        # Load
+        task_load = progress.add_task("[cyan]Loading...", total=None)
+        docs = load_slack_export(path)
+        progress.update(task_load, completed=1, total=1, description=f"[cyan]Loaded {len(docs)} documents")
+        _debug(f"Loaded {len(docs)} raw documents")
+
+        # Chunk
+        task_chunk = progress.add_task("[green]Chunking...", total=None)
+        chunks = chunk_documents(docs)
+        progress.update(task_chunk, completed=1, total=1, description=f"[green]Created {len(chunks)} chunks")
+        _debug(f"Created {len(chunks)} chunks")
+
+        # Store
+        task_store = progress.add_task("[magenta]Storing...", total=None)
+        init_db()
+        stored = store_chunks(chunks)
+        progress.update(task_store, completed=1, total=1, description=f"[magenta]Stored {stored} chunks")
+        _debug(f"Stored {stored} new chunks")
+
+    elapsed = time.time() - start
+    console.print(
+        f"\n[bold green]Ingest complete.[/bold green] "
+        f"{len(docs)} docs → {len(chunks)} chunks → {stored} stored "
+        f"({elapsed:.1f}s)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# extract
+# ---------------------------------------------------------------------------
+
+@cli.command()
+@click.option("--query", required=True, help="Natural language query for the rule to extract")
+@click.option("--save", is_flag=True, default=True, show_default=True,
+              help="Save extracted rule to rules/extracted/")
+def extract(query: str, save: bool):
+    """Run the extraction pipeline for a query"""
+    console.print(Panel.fit(f"Extracting rule for: {query}", style="bold blue"))
+
+    start = time.time()
+    final_state = run_extraction(query)
+    elapsed = time.time() - start
+
+    status = final_state.get("verification_status", "unknown")
+    confidence = final_state.get("rule_confidence", 0.0)
+    repairs = final_state.get("json_repair_attempts", 0)
+    source_count = len(final_state.get("source_refs", []))
+    rule_text = final_state.get("candidate_rule", "")
+
+    # Status colour
+    status_colour = {
+        "verified": "green",
+        "needs_review": "yellow",
+        "rejected": "red",
+        "parse_failed": "red",
+    }.get(status, "white")
+
+    console.print()
+    console.print(Panel(
+        f"[bold]{rule_text or '(no rule extracted)'}[/bold]\n\n"
+        f"Confidence: [bold]{confidence:.2f}[/bold]  |  "
+        f"Status: [bold {status_colour}]{status}[/bold {status_colour}]  |  "
+        f"Sources: {source_count}  |  "
+        f"Repair attempts: {repairs}  |  "
+        f"Time: {elapsed:.1f}s",
+        title="Extraction Result",
+        border_style=status_colour,
+    ))
+
+    if status == "parse_failed":
+        console.print(
+            "\n[yellow]⚠ Warning: The LLM produced unparseable JSON even after repair.[/yellow]\n"
+            "Suggestion: try a more capable model, or increase MAX_JSON_RETRIES in your .env"
+        )
+
+    if status == "rejected":
+        reason = final_state.get("rejection_reason", "unknown")
+        console.print(f"\n[dim]Rejection reason: {reason}[/dim]")
+
+    if save and final_state.get("final_rule"):
+        try:
+            rule = BusinessRule(**final_state["final_rule"])
+            path = save_rule(rule)
+            console.print(f"\n[green]✓ Saved to {path}[/green]")
+        except Exception as exc:
+            console.print(f"\n[red]✗ Failed to save rule: {exc}[/red]")
+
+
+# ---------------------------------------------------------------------------
+# review
+# ---------------------------------------------------------------------------
+
+@cli.command()
+def review():
+    """Interactive human review of rules flagged for review"""
+    rules = load_rules()
+    needs_review = [r for r in rules if r.verification_status == "needs_review"]
+
+    if not needs_review:
+        console.print("[green]No rules awaiting review.[/green]")
+        return
+
+    console.print(Panel.fit(f"{len(needs_review)} rule(s) need review", style="bold yellow"))
+
+    table = Table(title="Rules Awaiting Review")
+    table.add_column("#", style="cyan", justify="right")
+    table.add_column("Rule", style="white", max_width=50)
+    table.add_column("Category", style="magenta")
+    table.add_column("Confidence", style="green")
+    table.add_column("Version", style="yellow")
+
+    for i, rule in enumerate(needs_review, 1):
+        table.add_row(
+            str(i),
+            rule.rule_text[:60] + "..." if len(rule.rule_text) > 60 else rule.rule_text,
+            rule.rule_category,
+            f"{rule.confidence:.2f}",
+            str(rule.version),
+        )
+    console.print(table)
+
+    for rule in needs_review:
+        console.print(f"\n[bold]Rule:[/bold] {rule.rule_text}")
+        console.print(f"[dim]Category: {rule.rule_category} | Confidence: {rule.confidence:.2f} | Version: {rule.version}[/dim]")
+        action = click.prompt(
+            "Action: (a)pprove / (r)eject / (e)dit / (s)kip",
+            type=click.Choice(["a", "r", "e", "s"], case_sensitive=False),
+        )
+
+        if action == "a":
+            from output.writer import update_rule
+            updated = update_rule(
+                rule.rule_id,
+                {"verification_status": "verified", "approved_by": "human_review"},
+            )
+            console.print(f"[green]✓ Approved (version {updated.version})[/green]")
+
+        elif action == "r":
+            reason = click.prompt("Rejection reason")
+            from output.writer import update_rule
+            updated = update_rule(
+                rule.rule_id,
+                {"verification_status": "rejected", "ambiguity_notes": reason},
+            )
+            console.print(f"[red]✗ Rejected (version {updated.version})[/red]")
+
+        elif action == "e":
+            new_text = click.edit(rule.rule_text)
+            if new_text and new_text.strip() != rule.rule_text.strip():
+                from output.writer import update_rule
+                updated = update_rule(
+                    rule.rule_id,
+                    {"rule_text": new_text.strip()},
+                )
+                console.print(f"[yellow]✎ Edited (version {updated.version})[/yellow]")
+            else:
+                console.print("[dim]No changes made.[/dim]")
+
+        elif action == "s":
+            console.print("[dim]Skipped.[/dim]")
+
+
+# ---------------------------------------------------------------------------
+# status
+# ---------------------------------------------------------------------------
+
+@cli.command()
+def status():
+    """Show system status dashboard"""
+    try:
+        cfg = get_config()
+    except FileNotFoundError:
+        console.print("[red]No provider.config.yaml found. Run `python run.py setup` first.[/red]")
+        return
+
+    console.print(Panel.fit("KORE Status Dashboard", style="bold blue"))
+
+    # Provider info
+    console.print("\n[bold]Providers[/bold]")
+    console.print(f"  Deployment mode: [cyan]{cfg.deployment_mode}[/cyan]")
+    console.print(f"  LLM:             [cyan]{cfg.llm_provider}[/cyan] / [magenta]{cfg.llm_model}[/magenta]")
+    console.print(f"  Embedding:       [cyan]{cfg.embedding_provider}[/cyan] / [magenta]{cfg.embedding_model}[/magenta]")
+    console.print(f"  Dimensions:      [cyan]{cfg.embedding_dimensions}[/cyan]")
+
+    # Vector store stats
+    console.print("\n[bold]Vector Store[/bold]")
+    try:
+        conn = _connect()
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM document_chunks;")
+            total_chunks = cur.fetchone()[0]
+            console.print(f"  Total chunks:    [green]{total_chunks}[/green]")
+
+            # Chunks by source type
+            cur.execute(
+                "SELECT metadata->>'source_type', COUNT(*) "
+                "FROM document_chunks GROUP BY metadata->>'source_type';"
+            )
+            for row in cur.fetchall():
+                src = row[0] or "unknown"
+                console.print(f"    {src}: {row[1]}")
+        conn.close()
+    except Exception as exc:
+        console.print(f"  [red]DB unavailable: {exc}[/red]")
+
+    # Rules stats
+    console.print("\n[bold]Extracted Rules[/bold]")
+    rules = load_rules()
+    if rules:
+        status_counts = Counter(r.verification_status for r in rules)
+        cat_counts = Counter(r.rule_category for r in rules)
+
+        console.print(f"  Total rules:     [green]{len(rules)}[/green]")
+        console.print("  By status:")
+        for st, cnt in sorted(status_counts.items()):
+            colour = {"verified": "green", "needs_review": "yellow", "rejected": "red", "parse_failed": "red"}.get(st, "white")
+            console.print(f"    [{colour}]{st}[/{colour}]: {cnt}")
+
+        console.print("  By category:")
+        for cat, cnt in sorted(cat_counts.items()):
+            console.print(f"    {cat}: {cnt}")
+
+        # Repair stats
+        total_repairs = sum(
+            r.extraction_meta.json_repair_attempts for r in rules if r.extraction_meta
+        )
+        avg_repairs = total_repairs / len(rules) if rules else 0
+        console.print(f"  JSON repairs:    total={total_repairs}, avg={avg_repairs:.1f}")
+
+        # Last extraction
+        try:
+            latest = max(r.created_at for r in rules if r.created_at)
+            console.print(f"  Last extraction: {latest}")
+        except Exception:
+            pass
+    else:
+        console.print("  [dim]No rules extracted yet.[/dim]")
+
+
+# ---------------------------------------------------------------------------
+# reset-db
+# ---------------------------------------------------------------------------
+
+@cli.command()
+def reset_db():
+    """Drop and recreate the document_chunks table"""
+    console.print(Panel.fit("Reset Database", style="bold red"))
+    console.print("[red]This deletes all stored chunks.[/red]")
+
+    if not click.confirm("Are you sure?"):
+        console.print("[yellow]Cancelled.[/yellow]")
+        return
+
+    try:
+        conn = _connect()
+        with conn.cursor() as cur:
+            cur.execute("DROP TABLE IF EXISTS document_chunks;")
+            conn.commit()
+        conn.close()
+        console.print("[green]✓ Dropped document_chunks table.[/green]")
+
+        init_db()
+        console.print("[green]✓ Recreated document_chunks table.[/green]")
+    except Exception as exc:
+        console.print(f"[red]✗ Failed: {exc}[/red]")
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    cli()

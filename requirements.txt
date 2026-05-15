@@ -1,0 +1,30 @@
+# CLI
+click>=8.0
+rich>=13.0
+
+# Provider abstraction (LLM + embeddings)
+litellm>=1.40.0
+
+# Config / data parsing
+pyyaml>=6.0
+python-dotenv>=1.0
+
+# Lenient JSON parsers for local model repair loop
+json5>=0.9.0
+demjson3>=3.0
+
+# Schema validation
+pydantic>=2.0
+
+# Orchestration
+langgraph>=0.0.50
+langchain-core>=0.1.0
+
+# Data connectors (install per source as needed)
+# See https://llamahub.ai for the full catalog
+llama-index>=0.10.0
+llama-index-readers-slack>=0.1.0
+
+# Vector store
+psycopg2-binary>=2.9.0
+pgvector>=0.2.0
