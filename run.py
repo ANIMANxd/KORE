@@ -18,7 +18,7 @@ load_dotenv()
 
 from engine.graph import run_extraction
 from ingestion.chunker import chunk_documents
-from ingestion.loader import load_slack_export
+from ingestion.loader import load
 from output.schema import BusinessRule
 from output.writer import load_rules, save_rule
 from providers.config import ProviderConfig, get_config, load_config
@@ -248,14 +248,111 @@ def setup():
 
 
 # ---------------------------------------------------------------------------
+# slack-setup
+# ---------------------------------------------------------------------------
+
+@cli.command("slack-setup")
+def slack_setup():
+    """Interactive setup for live Slack API ingestion"""
+    console.print(Panel.fit("Slack Live Ingestion Setup", style="bold blue"))
+
+    console.print("""
+[bold]Prerequisites:[/bold]
+1. Go to [link]https://api.slack.com/apps[/link] and click [bold]Create New App[/bold] → [bold]From scratch[/bold]
+2. Name it "KORE Ingestion" and select your workspace
+3. Go to [bold]OAuth & Permissions[/bold] → [bold]Bot Token Scopes[/bold]
+4. Add these scopes:
+   • channels:history   (read messages)
+   • channels:read      (view channel info)
+   • users:read         (map user IDs to names)
+5. Click [bold]Install to Workspace[/bold] → [bold]Allow[/bold]
+6. Copy the [bold]Bot User OAuth Token[/bold] (starts with xoxb-)
+7. In each channel you want to ingest, type: /invite @kore-ingestion
+""")
+
+    if not click.confirm("Have you completed the steps above?"):
+        console.print("[yellow]Setup cancelled. Complete the steps and run again.[/yellow]")
+        return
+
+    # Bot Token
+    while True:
+        token = click.prompt("Bot User OAuth Token", hide_input=True)
+        if token.startswith("xoxb-"):
+            break
+        console.print("[red]Invalid token. Must start with 'xoxb-'. Try again.[/red]")
+
+    # Channel IDs
+    channel_ids = click.prompt(
+        "Channel IDs (comma-separated, e.g. C01234567,C09876543)\n"
+        "Tip: Right-click channel → Copy link → ID is the last segment"
+    )
+
+    # Earliest date
+    if click.confirm("Set a date limit? (only ingest messages after this date)", default=False):
+        earliest_date = click.prompt("Earliest date (YYYY-MM-DD)", default="")
+    else:
+        earliest_date = ""
+
+    # Test connection
+    console.print("\n[bold]Testing Slack connection...[/bold]")
+    try:
+        from slack_sdk import WebClient
+        client = WebClient(token=token)
+        auth = client.auth_test()
+        console.print(f"  [green]✓[/green] Connected as [bold]{auth['user']}[/bold] in workspace [bold]{auth['team']}[/bold]")
+
+        # Test each channel
+        for ch_id in [c.strip() for c in channel_ids.split(",") if c.strip()]:
+            try:
+                info = client.conversations_info(channel=ch_id)
+                ch_name = info["channel"]["name"]
+                # Test history access
+                hist = client.conversations_history(channel=ch_id, limit=1)
+                msg_count = hist.get("messages", [])
+                console.print(f"  [green]✓[/green] #{ch_name}: accessible ({len(msg_count)} messages in latest fetch)")
+            except Exception as e:
+                error = str(e)
+                if "not_in_channel" in error:
+                    console.print(f"  [red]✗[/red] {ch_id}: Bot not in channel. Run /invite @{auth['user']} in this channel.")
+                else:
+                    console.print(f"  [red]✗[/red] {ch_id}: {error}")
+    except Exception as e:
+        console.print(f"[red]Connection failed: {e}[/red]")
+        if not click.confirm("Save config anyway?"):
+            return
+
+    # Save to .env
+    env_path = Path(".env")
+    env_lines = []
+    if env_path.exists():
+        env_lines = env_path.read_text(encoding="utf-8").splitlines()
+
+    # Remove old Slack entries
+    env_lines = [line for line in env_lines if not line.startswith(("SLACK_BOT_TOKEN=", "SLACK_CHANNEL_IDS=", "SLACK_EARLIEST_DATE="))]
+
+    env_lines.append(f"SLACK_BOT_TOKEN={token}")
+    env_lines.append(f"SLACK_CHANNEL_IDS={channel_ids}")
+    if earliest_date:
+        env_lines.append(f"SLACK_EARLIEST_DATE={earliest_date}")
+
+    env_path.write_text("\n".join(env_lines) + "\n", encoding="utf-8")
+    console.print("\n[green]✓ Saved Slack credentials to .env[/green]")
+
+    if click.confirm("Run live ingestion now?"):
+        ctx = click.get_current_context()
+        ctx.invoke(ingest, source_type="slack", live=True)
+
+
+# ---------------------------------------------------------------------------
 # ingest
 # ---------------------------------------------------------------------------
 
 @cli.command()
 @click.option("--source", "source_type", type=click.Choice(["slack"], case_sensitive=False),
               required=True, help="Data source type")
-@click.option("--path", required=True, help="Path to export directory")
-def ingest(source_type: str, path: str):
+@click.option("--path", required=False, help="Path to export directory (required for local mode)")
+@click.option("--live", is_flag=True, help="Ingest via live API instead of local export")
+def ingest(source_type: str, path: str | None, live: bool):
     """Ingest data: load → chunk → embed → store"""
     start = time.time()
 
@@ -263,7 +360,13 @@ def ingest(source_type: str, path: str):
         console.print(f"[red]Source '{source_type}' not yet implemented. Only 'slack' is supported in Phase 1.[/red]")
         return
 
-    console.print(Panel.fit(f"Ingesting {source_type} data from {path}", style="bold blue"))
+    if live:
+        console.print(Panel.fit("Ingesting live Slack data", style="bold blue"))
+    else:
+        if not path:
+            console.print("[red]--path is required for local export mode. Use --live for API ingestion.[/red]")
+            return
+        console.print(Panel.fit(f"Ingesting {source_type} data from {path}", style="bold blue"))
 
     with Progress(
         SpinnerColumn(),
@@ -274,7 +377,10 @@ def ingest(source_type: str, path: str):
     ) as progress:
         # Load
         task_load = progress.add_task("[cyan]Loading...", total=None)
-        docs = load_slack_export(path)
+        if live:
+            docs = load(source_type, live=True)
+        else:
+            docs = load(source_type, path=path)
         progress.update(task_load, completed=1, total=1, description=f"[cyan]Loaded {len(docs)} documents")
         _debug(f"Loaded {len(docs)} raw documents")
 

@@ -403,10 +403,10 @@ if __name__ == "__main__":
     import sys
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    from ingestion.loader import load_slack_export
+    from ingestion.loader import load
 
     # Load Slack sample data
-    docs = load_slack_export("data/sample")
+    docs = load("slack", path="data/sample")
     print(f"Loaded {len(docs)} raw documents from Slack export\n")
 
     chunks = chunk_documents(docs)
