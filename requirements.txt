@@ -24,7 +24,14 @@ langchain-core>=0.1.0
 # See https://llamahub.ai for the full catalog
 llama-index>=0.10.0
 llama-index-readers-slack>=0.1.0
+llama-index-readers-github>=0.1.0
+llama-index-readers-notion>=0.1.0
+llama-index-readers-jira>=0.1.0
 
-# Vector store
+# Vector store (default: LanceDB)
+lancedb>=0.17.0
+pandas>=2.0.0
+
+# pgvector backend only — not needed for LanceDB
 psycopg2-binary>=2.9.0
 pgvector>=0.2.0

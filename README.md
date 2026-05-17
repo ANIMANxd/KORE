@@ -2,7 +2,7 @@
 
 An AI-powered system that ingests fragmented company data from sources like Slack, Notion, GitHub, and Jira, extracts hidden business rules using LLM reasoning, and outputs structured, validated YAML/JSON skill files that AI agents can enforce reliably.
 
-**Phase**: Phase 1 (MVP) - Complete. Provider abstraction + Slack ingestion + pgvector storage + LangGraph extraction pipeline + CLI + tests.
+**Phase**: Phase 3 (Real Connectors) - Complete. Vector store backend abstraction (LanceDB + pgvector) + live connectors for Slack, GitHub, Notion, and Jira.
 
 ---
 
@@ -10,12 +10,12 @@ An AI-powered system that ingests fragmented company data from sources like Slac
 
 ### 1. Provider Abstraction Layer (`providers/`)
 
-The entire system is provider-agnostic. Users bring their own LLM and embedding models - cloud or local. **No model names are hardcoded anywhere.**
+The entire system is provider-agnostic. Users bring their own LLM and embedding models — cloud or local. **No model names are hardcoded anywhere.**
 
 - **`registry.py`** - Master registry of 12 supported providers (OpenAI, Anthropic, Gemini, DeepSeek, Mistral, Cohere, Azure, Bedrock, Ollama, LM Studio, LocalAI, Custom). Defines what each provider needs (API key, base URL, LiteLLM prefix).
-- **`config.py`** - Loads and validates `provider.config.yaml`. Validates provider names against registry, enforces API keys for cloud providers, auto-fills default base URLs for local providers. Singleton pattern for cached config.
+- **`config.py`** - Loads and validates `provider.config.yaml`. Validates provider names against registry, enforces API keys for cloud providers, auto-fills default base URLs for local providers. Reads vector store backend selection. Singleton pattern for cached config.
 - **`llm.py`** - **The only file that calls LiteLLM.** Wraps all LLM calls with:
-  - JSON repair loop (mandatory - retries up to 3 times with repair instructions when local models produce malformed JSON)
+  - JSON repair loop (mandatory — retries up to 3 times with repair instructions when local models produce malformed JSON)
   - Rate-limit retry with exponential backoff
   - `response_format={"type": "json_object"}` for supported providers
   - `JSONRepairFailed` exception with raw output attached
@@ -25,38 +25,46 @@ The entire system is provider-agnostic. Users bring their own LLM and embedding 
   - Batch size 100, retry logic, progress tracking
   - Dimension validation against config
 
-### 2. CLI Setup (`run.py`)
+### 2. Vector Store Backend Abstraction (`storage/`)
+
+Hybrid backend architecture — identical public interface regardless of backend:
+
+- **`vector_store.py`** - Public interface (backend-agnostic singleton). All modules outside `storage/` call these functions only.
+- **`backends/base.py`** - Abstract base class `VectorStoreBackend`
+- **`backends/lancedb_backend.py`** - **Default.** Zero-config, file-based, embedded. Stores data at `~/.kore/data/vectors/`. Uses PyArrow schema. Handles deduplication and cosine similarity search.
+- **`backends/pgvector_backend.py`** - Enterprise option for existing PostgreSQL servers. Full connection retry logic, dimension validation, cosine similarity search.
+
+**Backend selection** is read from `provider.config.yaml`. Switching backends is one config line.
+
+### 3. CLI Setup (`run.py`)
 
 Interactive configuration wizard using Click and Rich:
 
 ```bash
-python run.py setup          # Interactive provider configuration
+python run.py setup          # Interactive provider + vector store configuration
 python run.py slack-setup    # Interactive Slack bot setup (token, channels, test connection)
+python run.py github-setup   # Interactive GitHub setup (token, repo, branch, test connection)
+python run.py notion-setup   # Interactive Notion setup (integration token, test connection)
+python run.py jira-setup     # Interactive Jira setup (server, email, API token, project keys, test connection)
 python run.py status         # Show system status dashboard
 ```
 
-### 3. Data Ingestion (`ingestion/`)
+### 4. Data Ingestion (`ingestion/`)
 
-- **`loader.py`** - Dual-mode Slack loader:
-  - **Local export mode**: Parses Slack export JSON directories into LlamaIndex `Document` objects
-  - **Live API mode**: Connects to Slack via Bot Token, fetches messages in real-time
-  - Filters bot/system/empty messages
-  - Preserves metadata: `source_type`, `channel`, `timestamp`, `user_id`, `thread_ts`, `message_id`
+- **`loader.py`** - Multi-source loader supporting local exports and live APIs:
+  - **Slack (local export)**: Parses Slack export JSON directories into LlamaIndex `Document` objects
+  - **Slack (live API)**: Connects via Bot Token, fetches messages in real-time with pagination
+  - **GitHub (live API)**: Reads repository files (filtered by extension) + issues/PRs. Excludes `node_modules`, `.git`, `dist`, `build`, etc. by default.
+  - **Notion (live API)**: Reads all accessible pages and databases via integration token
+  - **Jira (live API)**: Reads all issues from specified project keys via JQL. Auto-paginates through large result sets.
+  - Filters bot/system/empty messages per source
+  - Preserves source-aware metadata: `source_type`, channel/timestamp (Slack), repo/branch/file_path (GitHub), page_id (Notion), ticket_id/status/assignee (Jira)
 - **`chunker.py`** - Source-aware chunking strategies:
   - **Slack**: 15-minute time-window grouping (conversation bursts)
   - **GitHub**: Markdown + diff-aware, splits at H2/H3 headings, never splits code blocks
   - **Notion**: Heading-aware, tables preserved as single chunks
-  - **Jira**: Field-based - description + individual comment chunks
+  - **Jira**: Field-based — description + individual comment chunks
   - **Generic**: `SentenceSplitter` fallback (512 tokens, 50 overlap)
-
-### 4. Vector Storage (`storage/`)
-
-- **`vector_store.py`** - PostgreSQL + pgvector:
-  - `init_db()` - Creates `document_chunks` table with validated vector dimensions
-  - `store_chunks()` - Embeds and stores chunks, skips duplicates by chunk_id
-  - `similarity_search()` - Cosine similarity search with configurable threshold
-  - `get_chunks_by_ids()` - Fetch chunks by ID
-  - Connection retry logic (3 attempts with exponential backoff)
 
 ### 5. Extraction Engine (`engine/`)
 
@@ -90,26 +98,45 @@ LangGraph pipeline with conditional edges and loop guard:
 All commands built with Click + Rich:
 
 ```bash
-python run.py setup          # Interactive provider configuration
-python run.py slack-setup    # Interactive Slack bot setup (token, channels, test connection)
-python run.py ingest --source slack --path data/sample   # Local export
-python run.py ingest --source slack --live               # Live Slack API
-python run.py extract --query "refund policy" --save     # Full extraction pipeline
+# Setup
+python run.py setup          # Interactive provider + vector store configuration
+python run.py slack-setup    # Interactive Slack bot setup
+python run.py github-setup   # Interactive GitHub setup
+python run.py notion-setup   # Interactive Notion integration setup
+python run.py jira-setup     # Interactive Jira Cloud setup
+
+# Ingestion
+python run.py ingest --source slack --path data/sample     # Local Slack export
+python run.py ingest --source slack --live                 # Live Slack API
+python run.py ingest --source github --live                # Live GitHub API
+python run.py ingest --source notion --live                # Live Notion API
+python run.py ingest --source jira --live                  # Live Jira API
+
+# Extraction & review
+python run.py extract --query "refund policy" --save       # Full extraction pipeline
 python run.py review         # Interactive human review (approve/reject/edit)
+
+# System
 python run.py status         # Rich dashboard (providers, chunks, rules, repair stats)
-python run.py reset-db       # Drop and recreate document_chunks table
+python run.py reset-db       # Drop and recreate vector store
 python run.py --verbose ...  # Enable debug logging on any command
 ```
 
 ### 8. Test Suite (`tests/`)
 
-32 tests, all passing. No real LLM calls in tests - everything mocked.
+43 tests, all passing. No real LLM calls or network requests in tests — everything mocked.
 
 - **`test_json_repair.py`** (5) - Repair loop, markdown fences, exhaustion, counter
 - **`test_chunker.py`** (7) - Slack windowing, GitHub code blocks, generic fallback
 - **`test_extractor.py`** (5) - Success, parse_failed, confidence thresholds, meta
 - **`test_verifier.py`** (6) - Verified, rejected, contradictions, adjusted text
 - **`test_schema.py`** (9) - Pydantic validations, excerpt truncation, YAML round-trip
+- **`test_connectors.py`** (11) - All data sources and vector store backends mocked:
+  - Slack, GitHub, Notion, Jira loader metadata and routing
+  - Source-aware chunker selection (GitHub, Jira)
+  - LanceDB backend store/search with mocked PyArrow and lancedb
+  - Pgvector backend interface with mocked psycopg2 and pgvector
+  - Backend switching via config (LanceDB ↔ pgvector, invalid backend)
 
 Run: `pytest tests/ -v`
 
@@ -131,8 +158,8 @@ Fake Slack export for "Acme Corp" (50-person startup):
 |-------|-----------|---------|
 | **LLM Abstraction** | LiteLLM | Single interface for all providers (OpenAI, Anthropic, Ollama, LM Studio, etc.) |
 | **Embedding** | LiteLLM + direct HTTP (Ollama) | Text-to-vector for local and cloud models |
-| **Vector Store** | PostgreSQL + pgvector | Local, production-grade similarity search |
-| **Data Connectors** | LlamaIndex (`llama-index-readers-slack`) | Official Slack export parser |
+| **Vector Store** | **LanceDB** (default) + **pgvector** (enterprise) | Hybrid backend — LanceDB is zero-config file-based; pgvector connects to existing PostgreSQL |
+| **Data Connectors** | LlamaHub readers (`llama-index-readers-slack`, `-github`, `-notion`, `-jira`) | Official readers for Slack, GitHub, Notion, Jira |
 | **Chunking** | Custom + LlamaIndex `SentenceSplitter` | Source-aware strategies per document type |
 | **Orchestration** | LangGraph | Stateful reasoning pipeline with repair loops |
 | **Schema Validation** | Pydantic v2 | Output rule validation |
@@ -149,25 +176,29 @@ KORE/
 ├── AGENTS.md                    # Agent context and conventions
 ├── .env                         # Environment variables (gitignored)
 ├── .env.example                 # Example environment config
-├── provider.config.yaml         # User's LLM/embedding provider selection (gitignored)
+├── provider.config.yaml         # User's LLM/embedding/vector-store config (gitignored)
 ├── requirements.txt             # Python dependencies
 ├── run.py                       # CLI entry point
 │
 ├── providers/                   # Provider abstraction (the ONLY files touching LLM/embeddings)
 │   ├── __init__.py
 │   ├── registry.py              # Supported providers and their requirements
-│   ├── config.py                # Config loader and validator
+│   ├── config.py                # Config loader and validator (includes vector store config)
 │   ├── llm.py                   # LiteLLM wrapper + JSON repair loop
 │   └── embedder.py              # Embedding wrapper
 │
 ├── ingestion/                   # Data loading and chunking
 │   ├── __init__.py
-│   ├── loader.py                # Slack export parser + live API
+│   ├── loader.py                # Slack (local + live), GitHub (live), Notion (live), Jira (live)
 │   └── chunker.py               # Source-aware chunking strategies
 │
-├── storage/                     # Vector database
+├── storage/                     # Vector database (backend-agnostic)
 │   ├── __init__.py
-│   └── vector_store.py          # pgvector read/write
+│   ├── vector_store.py          # Public interface — identical for all backends
+│   └── backends/
+│       ├── base.py              # Abstract base class
+│       ├── lancedb_backend.py   # LanceDB (default, zero-config)
+│       └── pgvector_backend.py  # pgvector (enterprise option)
 │
 ├── engine/                      # LangGraph extraction pipeline
 │   ├── __init__.py
@@ -209,7 +240,7 @@ KORE/
 pip install -r requirements.txt
 ```
 
-### 2. Configure LLM providers
+### 2. Configure LLM providers and vector store
 
 ```bash
 python run.py setup
@@ -220,49 +251,90 @@ This interactively guides you through selecting:
 - LLM provider and model name
 - Embedding provider and model name
 - API keys (cloud) or base URLs (local)
+- **Vector store backend** (LanceDB recommended, or PostgreSQL + pgvector)
+- Data directory (LanceDB) or PostgreSQL connection URL (pgvector)
 
 ### 3. Set environment variables
 
 ```bash
 cp .env.example .env
-# Edit .env with your database URL:
-# DATABASE_URL=postgresql://user:password@localhost:5432/kore
+# Edit .env with your source credentials as needed:
+#
+# Slack (live API)
+# SLACK_BOT_TOKEN=xoxb-your-token
+# SLACK_CHANNEL_IDS=C01234567,C09876543
+# SLACK_EARLIEST_DATE=2024-01-01
+#
+# GitHub (live API)
+# GITHUB_TOKEN=ghp_your-token
+# GITHUB_REPO=owner/repo
+# GITHUB_BRANCH=main
+# GITHUB_EXTENSIONS=.py .md .yaml .yml .ts .js
+#
+# Notion (live API)
+# NOTION_TOKEN=ntn_your-token
+#
+# Jira (live API)
+# JIRA_URL=https://company.atlassian.net
+# JIRA_USERNAME=your-email@example.com
+# JIRA_API_TOKEN=your-token
+# JIRA_PROJECT_KEYS=KAN,PROJ
 ```
 
-### 4. Initialize database
+### 4. Initialize vector store
 
-```python
-from storage.vector_store import init_db
-init_db()
+The vector store is initialized automatically on first ingestion. No manual step required.
+
+Or reset it anytime:
+
+```bash
+python run.py reset-db
 ```
-
-Or use the CLI after setup.
 
 ### 5. Ingest data
 
-**Option A: Local Slack export**
+#### Slack
+
+**Local export:**
 
 ```bash
 python run.py ingest --source slack --path data/sample
 ```
 
-**Option B: Live Slack API**
+**Live API:**
 
 ```bash
-# Interactive setup (recommended)
 python run.py slack-setup
-
-# Then run live ingestion
 python run.py ingest --source slack --live
 ```
 
-The `slack-setup` wizard will:
-1. Guide you through creating a Slack app
-2. Ask for your Bot User OAuth Token (masked input)
-3. Ask for channel IDs
-4. Test the connection live
-5. Save everything to `.env`
-6. Optionally run ingestion immediately
+#### GitHub
+
+```bash
+python run.py github-setup
+python run.py ingest --source github --live
+```
+
+#### Notion
+
+```bash
+python run.py notion-setup
+python run.py ingest --source notion --live
+```
+
+#### Jira
+
+```bash
+python run.py jira-setup
+python run.py ingest --source jira --live
+```
+
+Each setup wizard will:
+1. Guide you through creating the necessary credentials
+2. Prompt for each value with context-specific hints
+3. Test the connection live
+4. Save everything to `.env`
+5. Optionally run ingestion immediately
 
 ### 6. Extract a rule
 
@@ -286,7 +358,7 @@ Interactive approval: `(a)pprove`, `(r)eject`, `(e)dit`, `(s)kip`.
 python run.py status
 ```
 
-Rich dashboard: providers, chunks by source, rules by status/category, repair stats.
+Rich dashboard: providers, vector store backend, chunks by source, rules by status/category, repair stats.
 
 ### 9. Run tests
 
@@ -296,44 +368,14 @@ pytest tests/ -v
 
 ---
 
-## Live Slack Ingestion
+## Supported Data Sources
 
-Instead of using a local Slack export ZIP, you can ingest directly from Slack's live API.
-
-### Quick setup (recommended)
-
-```bash
-python run.py slack-setup
-```
-
-This interactive wizard will:
-- Guide you through creating a Slack app
-- Ask for your Bot User OAuth Token (masked input)
-- Ask for channel IDs
-- Test the connection live
-- Save everything to `.env`
-- Optionally run ingestion immediately
-
-### Manual setup
-
-If you prefer to configure manually:
-
-1. Go to https://api.slack.com/apps - **Create New App** - **From scratch**
-2. Add Bot Token Scopes: `channels:history`, `channels:read`, `users:read`
-3. **Install to Workspace** - copy the `xoxb-` token
-4. Invite the bot to each channel: `/invite @your-bot-name`
-5. Add to `.env`:
-   ```bash
-   SLACK_BOT_TOKEN=xoxb-your-token-here
-   SLACK_CHANNEL_IDS=C01234567,C09876543
-   SLACK_EARLIEST_DATE=2024-01-01
-   ```
-
-### Run live ingestion
-
-```bash
-python run.py ingest --source slack --live
-```
+| Source | Mode | Setup Command | Requirements |
+|--------|------|---------------|--------------|
+| **Slack** | Local export + Live API | `python run.py slack-setup` | Slack app with Bot Token Scopes: `channels:history`, `channels:read`, `users:read` |
+| **GitHub** | Live API only | `python run.py github-setup` | Personal Access Token with `repo` or `public_repo` scope |
+| **Notion** | Live API only | `python run.py notion-setup` | Internal Integration Token + share each page/database with the integration |
+| **Jira** | Live API only | `python run.py jira-setup` | API Token from Atlassian account settings |
 
 ---
 
@@ -356,21 +398,43 @@ python run.py ingest --source slack --live
 
 ---
 
+## Vector Store Backends
+
+| Backend | Default | When to use | Requirements |
+|---------|---------|-------------|--------------|
+| **LanceDB** | Yes | Zero-config, file-based, ships in binary | Nothing — embedded |
+| **pgvector** | No | Enterprise with existing PostgreSQL | PostgreSQL + pgvector extension |
+
+Switching backends is one line in `provider.config.yaml`:
+
+```yaml
+vector_store:
+  backend: lancedb   # or pgvector
+  lancedb:
+    data_dir: ~/.kore/data
+  pgvector:
+    url: postgresql://user:pass@host:5432/dbname
+```
+
+---
+
 ## Known Issues & Quirks
 
 - **Local embedding similarity scores are lower** (~0.50-0.60) compared to OpenAI (~0.80+). Set `SIMILARITY_THRESHOLD=0.40` for local deployments.
 - **LiteLLM requires a dummy API key** for local providers (Ollama, LM Studio). Both `llm.py` and `embedder.py` handle this automatically.
 - **Ollama embeddings use direct HTTP** instead of LiteLLM for reliability (`/api/embeddings` endpoint).
+- **GithubRepositoryReader traverses git tree per-directory** (no recursive API flag). Large monorepos need `filter_directories` exclusion list. `node_modules`, `.git`, `__pycache__`, `dist`, `build`, `venv`, etc. are excluded by default.
+- **LanceDB uses `to_pandas()` for dedup** — acceptable for on-premise scale, may need optimisation for 100k+ chunks.
 
 ---
 
-## What's Next (Phase 2)
+## What's Next (Phase 4)
 
-- **Multi-source ingestion** - Notion, GitHub, Jira via LlamaHub readers
-- **Full chunking strategies** - GitHub diff-aware, Notion heading-aware, Jira field-based
-- **Conflict detection** - Cross-source contradiction detection in verifier
-- **REST API** - FastAPI layer for agent integration
-- **Docker Compose** - Full local deployment with PostgreSQL
+- **Rule lifecycle** — Contradiction detection, expiry detection, re-extraction triggers
+- **Skills export** — `skills.json` format for agent consumption
+- **TUI** — Textual 8-screen terminal interface
+- **Licensing** — HMAC license keys, 14-day trial mode
+- **Binary distribution** — PyInstaller single-file build
 
 ---
 

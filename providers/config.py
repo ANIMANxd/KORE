@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 from pathlib import Path
 
@@ -20,6 +20,9 @@ class ProviderConfig:
     embedding_base_url: str | None
     embedding_dimensions: int
     deployment_mode: Literal["cloud", "local", "hybrid"]
+    vector_store_backend: Literal["lancedb", "pgvector"] = "lancedb"
+    lancedb_data_dir: str = "~/.kore/data"
+    pgvector_url: str | None = None
 
 
 def _validate_and_resolve(
@@ -61,6 +64,7 @@ def load_config(path: str = "provider.config.yaml") -> ProviderConfig:
 
     llm_raw = raw.get("llm", {})
     embedding_raw = raw.get("embedding", {})
+    vector_store_raw = raw.get("vector_store", {})
 
     llm_provider = llm_raw.get("provider", "")
     llm_model = llm_raw.get("model", "")
@@ -76,6 +80,12 @@ def load_config(path: str = "provider.config.yaml") -> ProviderConfig:
 
     deployment_mode = raw.get("deployment_mode", "local")
 
+    vector_store_backend = vector_store_raw.get("backend", "lancedb")
+    lancedb_raw = vector_store_raw.get("lancedb", {})
+    pgvector_raw = vector_store_raw.get("pgvector", {})
+    lancedb_data_dir = lancedb_raw.get("data_dir", "~/.kore/data")
+    pgvector_url = pgvector_raw.get("url") or None
+
     if not llm_provider:
         raise ValueError("Missing 'llm.provider' in provider config.")
     if not llm_model:
@@ -86,6 +96,18 @@ def load_config(path: str = "provider.config.yaml") -> ProviderConfig:
         raise ValueError("Missing 'embedding.model' in provider config.")
     if embedding_dimensions <= 0:
         raise ValueError("Missing or invalid 'embedding.dimensions' in provider config.")
+
+    if vector_store_backend not in ("lancedb", "pgvector"):
+        raise ValueError(
+            f"Invalid vector_store.backend: {vector_store_backend!r}. "
+            f"Valid options: lancedb, pgvector"
+        )
+
+    if vector_store_backend == "pgvector" and not pgvector_url:
+        raise ValueError(
+            "vector_store.backend is 'pgvector' but pgvector.url is not set. "
+            "Provide a PostgreSQL connection URL in provider.config.yaml."
+        )
 
     llm_api_key, llm_base_url = _validate_and_resolve(
         llm_provider, llm_api_key, llm_base_url, context="LLM"
@@ -106,10 +128,14 @@ def load_config(path: str = "provider.config.yaml") -> ProviderConfig:
         embedding_base_url=embedding_base_url,
         embedding_dimensions=embedding_dimensions,
         deployment_mode=deployment_mode,
+        vector_store_backend=vector_store_backend,
+        lancedb_data_dir=lancedb_data_dir,
+        pgvector_url=pgvector_url,
     )
 
     print(f"[KORE] LLM active: {config.llm_provider} / {config.llm_model}")
     print(f"[KORE] Embedding active: {config.embedding_provider} / {config.embedding_model}")
+    print(f"[KORE] Vector store: {config.vector_store_backend}")
 
     return config
 

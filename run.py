@@ -25,7 +25,7 @@ from providers.config import ProviderConfig, get_config, load_config
 from providers.embedder import embed_text
 from providers.llm import test_connection
 from providers.registry import get_provider, list_providers
-from storage.vector_store import _connect, init_db, store_chunks
+from storage.vector_store import init_db, store_chunks, get_chunk_count, get_chunk_stats, reset_db as reset_vector_db, health_check
 
 console = Console()
 
@@ -149,8 +149,8 @@ def setup():
     llm_base_url = _ask_base_url(llm_provider)
     llm_temperature = click.prompt("Temperature", type=float, default=0.1)
 
-    # Step 5 — Embedding provider
-    console.print("\n[bold]Step 5 — Embedding provider[/bold]")
+    # Step 4 — Embedding provider
+    console.print("\n[bold]Step 4 — Embedding provider[/bold]")
     emb_provider, emb_model = _pick_provider("Available embedding providers")
     emb_api_key = _ask_api_key(emb_provider)
     emb_base_url = _ask_base_url(emb_provider)
@@ -159,6 +159,63 @@ def setup():
         "(check your provider's docs — common values: 768, 1024, 1536, 3072)",
         type=int,
     )
+
+    # Step 5 — Vector store
+    console.print("\n[bold]Step 5 — Vector store[/bold]")
+    console.print("[bold]Where do you want KORE to store your data?[/bold]\n")
+    console.print("[cyan][1][/cyan] LanceDB (recommended)")
+    console.print("    Local file-based storage. Zero configuration.")
+    console.print("    No server needed. Ships inside the KORE binary.\n")
+    console.print("[cyan][2][/cyan] PostgreSQL + pgvector")
+    console.print("    Connect to your existing PostgreSQL server.")
+    console.print("    Requires pgvector extension to be installed.\n")
+
+    vs_choice = click.prompt("Choose [1/2]", type=int)
+    if vs_choice == 2:
+        vector_store_backend = "pgvector"
+        default_url = os.getenv("DATABASE_URL", "")
+        pgvector_url = click.prompt(
+            "PostgreSQL connection URL",
+            default=default_url if default_url else "",
+            show_default=bool(default_url),
+        )
+        lancedb_data_dir = "~/.kore/data"
+
+        # Test connection
+        console.print("\n[bold]Testing pgvector connection...[/bold]")
+        try:
+            import psycopg2
+            conn = psycopg2.connect(pgvector_url)
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1 FROM pg_extension WHERE extname = 'vector';")
+                has_vector = cur.fetchone()
+            conn.close()
+            if has_vector:
+                console.print("  [green]✓[/green] Connected. pgvector extension found.")
+            else:
+                console.print("  [yellow]⚠[/yellow] pgvector extension [bold]not found[/bold].")
+                console.print(
+                    "    Run this in psql:\n"
+                    "    [bold]CREATE EXTENSION IF NOT EXISTS vector;[/bold]\n"
+                    "    Then re-run setup."
+                )
+                if not click.confirm("Save config anyway? (You must install pgvector before ingesting)"):
+                    console.print("[yellow]Switching to LanceDB.[/yellow]")
+                    vector_store_backend = "lancedb"
+                    pgvector_url = None
+        except Exception as exc:
+            console.print(f"  [red]✗[/red] Connection failed: {exc}")
+            if click.confirm("Switch to LanceDB instead?"):
+                vector_store_backend = "lancedb"
+                pgvector_url = None
+            elif not click.confirm("Save config with pgvector anyway?"):
+                console.print("[yellow]Setup cancelled.[/yellow]")
+                return
+    else:
+        vector_store_backend = "lancedb"
+        data_dir = click.prompt("Data directory", default="~/.kore/data", show_default=True)
+        lancedb_data_dir = data_dir
+        pgvector_url = None
 
     # Build temporary config for testing
     temp_config = ProviderConfig(
@@ -173,6 +230,9 @@ def setup():
         embedding_base_url=emb_base_url,
         embedding_dimensions=emb_dimensions,
         deployment_mode=mode,
+        vector_store_backend=vector_store_backend,
+        lancedb_data_dir=lancedb_data_dir,
+        pgvector_url=pgvector_url,
     )
 
     # Step 6 — Test connections
@@ -218,6 +278,15 @@ def setup():
             "api_key": emb_api_key,
             "base_url": emb_base_url,
             "dimensions": emb_dimensions,
+        },
+        "vector_store": {
+            "backend": vector_store_backend,
+            "lancedb": {
+                "data_dir": lancedb_data_dir,
+            },
+            "pgvector": {
+                "url": pgvector_url,
+            },
         },
         "deployment_mode": mode,
     }
@@ -344,11 +413,295 @@ def slack_setup():
 
 
 # ---------------------------------------------------------------------------
+# github-setup
+# ---------------------------------------------------------------------------
+
+@cli.command("github-setup")
+def github_setup():
+    """Interactive setup for live GitHub API ingestion"""
+    console.print(Panel.fit("GitHub Live Ingestion Setup", style="bold blue"))
+
+    console.print("""
+[bold]Prerequisites:[/bold]
+1. Go to [link]https://github.com/settings/tokens[/link] and click [bold]Generate new token (classic)[/bold]
+2. Give it a name like "KORE Ingestion"
+3. Select scopes:
+   • [bold]repo[/bold] (for private repos) or [bold]public_repo[/bold] (for public repos)
+   • [bold]read:user[/bold]
+4. Click [bold]Generate token[/bold] and copy it (starts with ghp_)
+""")
+
+    if not click.confirm("Have you completed the steps above?"):
+        console.print("[yellow]Setup cancelled. Complete the steps and run again.[/yellow]")
+        return
+
+    # Token
+    while True:
+        token = click.prompt("GitHub Personal Access Token", hide_input=True)
+        if token.startswith(("ghp_", "github_pat_")):
+            break
+        console.print("[red]Invalid token. Must start with 'ghp_' or 'github_pat_'. Try again.[/red]")
+
+    # Repo
+    while True:
+        repo_spec = click.prompt("Repo to ingest (format: owner/repo)")
+        parts = repo_spec.split("/")
+        if len(parts) == 2 and parts[0] and parts[1]:
+            break
+        console.print("[red]Invalid format. Expected 'owner/repo'. Try again.[/red]")
+
+    # Branch
+    branch = click.prompt("Branch", default="main", show_default=True)
+
+    # Extensions
+    extensions = click.prompt(
+        "File extensions to include (space-separated)",
+        default=".py .md .yaml .yml .ts .js",
+        show_default=True,
+    )
+
+    # Test connection
+    console.print(f"\n[bold]Testing GitHub connection to {repo_spec}...[/bold]")
+    try:
+        from llama_index.readers.github.repository.github_client import GithubClient
+
+        client = GithubClient(github_token=token)
+        branch_data = client.get_branch(repo_spec, branch)
+        if branch_data:
+            console.print(f"  [green]✓[/green] Connected to [bold]{repo_spec}[/bold] ({branch} branch)")
+        else:
+            branches_raw = client.request("GET", f"/repos/{repo_spec}/branches")
+            if branches_raw.status_code == 200:
+                branch_names = [b["name"] for b in branches_raw.json()]
+                console.print(f"  [green]✓[/green] Connected to [bold]{repo_spec}[/bold]")
+                console.print(f"  [yellow]⚠[/yellow] Branch '{branch}' not found. Available: {', '.join(branch_names[:5])}{'...' if len(branch_names) > 5 else ''}")
+                branch = click.prompt("Choose a branch", default=branch_names[0], show_default=True)
+            else:
+                console.print(f"  [red]✗[/red] API returned {branches_raw.status_code}")
+                if not click.confirm("Save config anyway?"):
+                    return
+    except Exception as e:
+        console.print(f"[red]Connection failed: {e}[/red]")
+        if not click.confirm("Save config anyway?"):
+            return
+
+    # Save to .env
+    env_path = Path(".env")
+    env_lines: list[str] = []
+    if env_path.exists():
+        env_lines = env_path.read_text(encoding="utf-8").splitlines()
+
+    env_lines = [
+        line
+        for line in env_lines
+        if not line.startswith(
+            ("GITHUB_TOKEN=", "GITHUB_REPO=", "GITHUB_BRANCH=", "GITHUB_EXTENSIONS=")
+        )
+    ]
+
+    env_lines.append(f"GITHUB_TOKEN={token}")
+    env_lines.append(f"GITHUB_REPO={repo_spec}")
+    env_lines.append(f"GITHUB_BRANCH={branch}")
+    env_lines.append(f"GITHUB_EXTENSIONS={extensions}")
+
+    env_path.write_text("\n".join(env_lines) + "\n", encoding="utf-8")
+    console.print("\n[green]✓ Saved GitHub credentials to .env[/green]")
+
+    if click.confirm("Run live ingestion now?"):
+        ctx = click.get_current_context()
+        ctx.invoke(ingest, source_type="github", live=True)
+
+
+# ---------------------------------------------------------------------------
+# notion-setup
+# ---------------------------------------------------------------------------
+
+@cli.command("notion-setup")
+def notion_setup():
+    """Interactive setup for live Notion API ingestion"""
+    console.print(Panel.fit("Notion Live Ingestion Setup", style="bold blue"))
+
+    console.print("""
+[bold]Prerequisites:[/bold]
+1. Go to [link]https://www.notion.so/my-integrations[/link]
+2. Click [bold]+ New integration[/bold]
+3. Name it "KORE Ingestion" and select your workspace
+4. Click [bold]Submit[/bold]
+5. Copy the [bold]Internal Integration Secret[/bold] (starts with ntn_ or secret_)
+6. For each page/database you want to ingest:
+   • Open the page in Notion
+   • Click [bold]...[/bold] (top-right) → [bold]Connections[/bold]
+   • Add "KORE Ingestion"
+""")
+
+    if not click.confirm("Have you completed the steps above?"):
+        console.print("[yellow]Setup cancelled. Complete the steps and run again.[/yellow]")
+        return
+
+    # Token
+    while True:
+        token = click.prompt("Notion Integration Token", hide_input=True)
+        if token.startswith(("ntn_", "secret_")):
+            break
+        console.print("[red]Invalid token. Must start with 'ntn_' or 'secret_'. Try again.[/red]")
+
+    # Test connection
+    console.print("\n[bold]Testing Notion connection...[/bold]")
+    try:
+        from llama_index.readers.notion import NotionPageReader
+
+        reader = NotionPageReader(integration_token=token)
+        databases = reader.list_databases()
+        pages = reader.list_pages()
+        console.print(f"  [green]✓[/green] Connected successfully")
+        console.print(f"  [dim]Databases found: {len(databases)}[/dim]")
+        console.print(f"  [dim]Pages found: {len(pages)}[/dim]")
+    except Exception as e:
+        console.print(f"[red]Connection failed: {e}[/red]")
+        console.print(
+            "[dim]Make sure the integration has access to pages.\n"
+            "In Notion, open each page → ... → Connections → add your integration.[/dim]"
+        )
+        if not click.confirm("Save config anyway?"):
+            return
+
+    # Save to .env
+    env_path = Path(".env")
+    env_lines: list[str] = []
+    if env_path.exists():
+        env_lines = env_path.read_text(encoding="utf-8").splitlines()
+
+    env_lines = [
+        line
+        for line in env_lines
+        if not line.startswith(("NOTION_TOKEN=", "NOTION_INTEGRATION_TOKEN="))
+    ]
+
+    env_lines.append(f"NOTION_TOKEN={token}")
+
+    env_path.write_text("\n".join(env_lines) + "\n", encoding="utf-8")
+    console.print("\n[green]✓ Saved Notion credentials to .env[/green]")
+
+    if click.confirm("Run live ingestion now?"):
+        ctx = click.get_current_context()
+        ctx.invoke(ingest, source_type="notion", live=True)
+
+
+# ---------------------------------------------------------------------------
+# jira-setup
+# ---------------------------------------------------------------------------
+
+@cli.command("jira-setup")
+def jira_setup():
+    """Interactive setup for live Jira API ingestion"""
+    console.print(Panel.fit("Jira Live Ingestion Setup", style="bold blue"))
+
+    console.print("""
+[bold]Prerequisites:[/bold]
+
+[bold]1. Server URL[/bold]
+   Open Jira in your browser. The URL is something like:
+   [cyan]https://yourcompany.atlassian.net[/cyan]
+   Copy that exact URL.
+
+[bold]2. Username[/bold]
+   Use the email address you log into Atlassian with.
+
+[bold]3. API Token[/bold]
+   a. Go to [link]https://id.atlassian.com/manage-profile/security/api-tokens[/link]
+   b. Click [bold]Create API token[/bold]
+   c. Label: "KORE Ingestion"
+   d. Click [bold]Create[/bold] — a modal appears with your token
+   e. Click [bold]Copy[/bold] immediately (you cannot view it again)
+   f. The token is ~70 characters long, starts with letters/numbers
+
+[bold]4. Project Key(s)[/bold]
+   In Jira, open any project. The key is the short prefix on tickets
+   (e.g. [bold]KAN-123[/bold] → project key is [bold]KAN[/bold]).
+   You can find it in Project Settings → Details.
+""")
+
+    if not click.confirm("Have you completed the steps above?"):
+        console.print("[yellow]Setup cancelled. Complete the steps and run again.[/yellow]")
+        return
+
+    # Server URL
+    server_url = click.prompt(
+        "Jira server URL (e.g. https://company.atlassian.net)"
+    )
+
+    # Username
+    username = click.prompt("Jira username (your Atlassian email)")
+
+    # API token
+    api_token = click.prompt(
+        "Jira API token (the ~70 char string from the API token page)",
+        hide_input=True,
+    )
+
+    # Project keys
+    project_keys = click.prompt(
+        "Project keys (comma-separated, e.g. KAN,PROJ)"
+    )
+
+    # Test connection
+    console.print("\n[bold]Testing Jira connection...[/bold]")
+    try:
+        from llama_index.readers.jira import JiraReader
+
+        domain = server_url.replace("https://", "").replace("http://", "").strip("/")
+        reader = JiraReader(
+            email=username,
+            api_token=api_token,
+            server_url=domain,
+        )
+        keys = [k.strip() for k in project_keys.split(",") if k.strip()]
+        if len(keys) == 1:
+            jql = f"project = {keys[0]}"
+        else:
+            jql = f"project in ({', '.join(keys)})"
+
+        docs = reader.load_data(query=jql, start_at=0, max_results=1)
+        console.print(f"  [green]✓[/green] Connected successfully")
+        console.print(f"  [dim]Projects: {', '.join(keys)} | Sample query returned {len(docs)} issue(s)[/dim]")
+    except Exception as e:
+        console.print(f"[red]Connection failed: {e}[/red]")
+        if not click.confirm("Save config anyway?"):
+            return
+
+    # Save to .env
+    env_path = Path(".env")
+    env_lines: list[str] = []
+    if env_path.exists():
+        env_lines = env_path.read_text(encoding="utf-8").splitlines()
+
+    env_lines = [
+        line
+        for line in env_lines
+        if not line.startswith(
+            ("JIRA_URL=", "JIRA_USERNAME=", "JIRA_API_TOKEN=", "JIRA_PROJECT_KEYS=")
+        )
+    ]
+
+    env_lines.append(f"JIRA_URL={server_url}")
+    env_lines.append(f"JIRA_USERNAME={username}")
+    env_lines.append(f"JIRA_API_TOKEN={api_token}")
+    env_lines.append(f"JIRA_PROJECT_KEYS={project_keys}")
+
+    env_path.write_text("\n".join(env_lines) + "\n", encoding="utf-8")
+    console.print("\n[green]✓ Saved Jira credentials to .env[/green]")
+
+    if click.confirm("Run live ingestion now?"):
+        ctx = click.get_current_context()
+        ctx.invoke(ingest, source_type="jira", live=True)
+
+
+# ---------------------------------------------------------------------------
 # ingest
 # ---------------------------------------------------------------------------
 
 @cli.command()
-@click.option("--source", "source_type", type=click.Choice(["slack"], case_sensitive=False),
+@click.option("--source", "source_type", type=click.Choice(["slack", "github", "notion", "jira"], case_sensitive=False),
               required=True, help="Data source type")
 @click.option("--path", required=False, help="Path to export directory (required for local mode)")
 @click.option("--live", is_flag=True, help="Ingest via live API instead of local export")
@@ -356,12 +709,15 @@ def ingest(source_type: str, path: str | None, live: bool):
     """Ingest data: load → chunk → embed → store"""
     start = time.time()
 
-    if source_type != "slack":
-        console.print(f"[red]Source '{source_type}' not yet implemented. Only 'slack' is supported in Phase 1.[/red]")
+    if source_type in ("github", "notion", "jira"):
+        live = True
+
+    if source_type not in ("slack", "github", "notion", "jira"):
+        console.print(f"[red]Source '{source_type}' not yet implemented. Supported: slack, github, notion, jira.[/red]")
         return
 
     if live:
-        console.print(Panel.fit("Ingesting live Slack data", style="bold blue"))
+        console.print(Panel.fit(f"Ingesting live {source_type} data", style="bold blue"))
     else:
         if not path:
             console.print("[red]--path is required for local export mode. Use --live for API ingestion.[/red]")
@@ -565,23 +921,15 @@ def status():
     # Vector store stats
     console.print("\n[bold]Vector Store[/bold]")
     try:
-        conn = _connect()
-        with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM document_chunks;")
-            total_chunks = cur.fetchone()[0]
-            console.print(f"  Total chunks:    [green]{total_chunks}[/green]")
+        total_chunks = get_chunk_count()
+        console.print(f"  Total chunks:    [green]{total_chunks}[/green]")
+        console.print(f"  Backend:         [cyan]{cfg.vector_store_backend}[/cyan]")
 
-            # Chunks by source type
-            cur.execute(
-                "SELECT metadata->>'source_type', COUNT(*) "
-                "FROM document_chunks GROUP BY metadata->>'source_type';"
-            )
-            for row in cur.fetchall():
-                src = row[0] or "unknown"
-                console.print(f"    {src}: {row[1]}")
-        conn.close()
+        stats = get_chunk_stats()
+        for src, cnt in sorted(stats.items()):
+            console.print(f"    {src}: {cnt}")
     except Exception as exc:
-        console.print(f"  [red]DB unavailable: {exc}[/red]")
+        console.print(f"  [red]Store unavailable: {exc}[/red]")
 
     # Rules stats
     console.print("\n[bold]Extracted Rules[/bold]")
@@ -623,7 +971,7 @@ def status():
 
 @cli.command()
 def reset_db():
-    """Drop and recreate the document_chunks table"""
+    """Drop and recreate the vector store"""
     console.print(Panel.fit("Reset Database", style="bold red"))
     console.print("[red]This deletes all stored chunks.[/red]")
 
@@ -632,15 +980,8 @@ def reset_db():
         return
 
     try:
-        conn = _connect()
-        with conn.cursor() as cur:
-            cur.execute("DROP TABLE IF EXISTS document_chunks;")
-            conn.commit()
-        conn.close()
-        console.print("[green]✓ Dropped document_chunks table.[/green]")
-
-        init_db()
-        console.print("[green]✓ Recreated document_chunks table.[/green]")
+        reset_vector_db()
+        console.print("[green]✓ Vector store reset complete.[/green]")
     except Exception as exc:
         console.print(f"[red]✗ Failed: {exc}[/red]")
 
