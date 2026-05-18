@@ -16,10 +16,14 @@ from rich.table import Table
 from dotenv import load_dotenv
 load_dotenv()
 
+from engine.contradiction_detector import find_contradictions, save_contradiction_report
+from engine.expiry_detector import scan_all_rules
 from engine.graph import run_extraction
+from engine.reextractor import find_affected_rules, reextract_rule
 from ingestion.chunker import chunk_documents
 from ingestion.loader import load
 from output.schema import BusinessRule
+from output.skills_writer import export_skills_json
 from output.writer import load_rules, save_rule
 from providers.config import ProviderConfig, get_config, load_config
 from providers.embedder import embed_text
@@ -818,8 +822,163 @@ def extract(query: str, save: bool):
             rule = BusinessRule(**final_state["final_rule"])
             path = save_rule(rule)
             console.print(f"\n[green]✓ Saved to {path}[/green]")
+
+            # Auto-run contradiction detection against existing rules
+            existing_rules = load_rules()
+            contradictions = find_contradictions(rule, existing_rules)
+            if contradictions:
+                for report in contradictions:
+                    save_contradiction_report(report)
+                    console.print(
+                        Panel(
+                            f"[bold red]⚠ Contradiction detected with rule {report.rule_id_b[:8]}:[/bold red]\n"
+                            f"{report.contradiction_description}\n"
+                            f"[dim]Severity: {report.severity}[/dim]",
+                            title="Rule Conflict",
+                            border_style="red",
+                        )
+                    )
         except Exception as exc:
             console.print(f"\n[red]✗ Failed to save rule: {exc}[/red]")
+
+
+# ---------------------------------------------------------------------------
+# check-expiry
+# ---------------------------------------------------------------------------
+
+@cli.command("check-expiry")
+@click.option("--days", default=90, show_default=True, help="Staleness threshold in days")
+@click.option("--dir", "rules_dir", default="rules/extracted/", show_default=True, help="Directory containing rule YAML files")
+def check_expiry(days: int, rules_dir: str):
+    """Scan rules for staleness based on source reference dates"""
+    console.print(Panel.fit(f"Checking rule expiry (>{days} days old)", style="bold blue"))
+
+    reports = scan_all_rules(rules_dir=rules_dir, days_threshold=days)
+
+    if not reports:
+        console.print("[green]✓ All rules are fresh — no expired rules found.[/green]")
+        return
+
+    table = Table(title=f"Expired Rules ({len(reports)} found)")
+    table.add_column("Rule Excerpt", style="white", max_width=45)
+    table.add_column("Category", style="magenta")
+    table.add_column("Last Referenced", style="cyan")
+    table.add_column("Days Old", style="yellow", justify="right")
+
+    for report in reports:
+        # Colour-code severity by age
+        days_old = report.days_since_referenced
+        if days_old > 365:
+            age_style = "bold red"
+        elif days_old > 180:
+            age_style = "red"
+        else:
+            age_style = "yellow"
+
+        table.add_row(
+            report.rule_text,
+            report.rule_category,
+            report.last_source_date.strftime("%Y-%m-%d"),
+            f"[{age_style}]{days_old}[/{age_style}]",
+        )
+
+    console.print(table)
+    console.print(
+        f"\n[dim]{len(reports)} rule(s) have not been referenced in the last {days} days. "
+        "Run [bold]python run.py extract --query ... --save[/bold] to re-extract from current data.[/dim]"
+    )
+
+
+# ---------------------------------------------------------------------------
+# reextract
+# ---------------------------------------------------------------------------
+
+@cli.command()
+@click.option("--rule-id", required=True, help="Full UUID of the rule to re-extract")
+@click.option("--query", required=False, help="Custom query (defaults to existing rule text)")
+@click.option("--save", is_flag=True, default=False, show_default=True, help="Auto-save without prompting")
+def reextract(rule_id: str, query: str | None, save: bool):
+    """Re-run extraction for an existing rule and optionally update it"""
+    rules = load_rules()
+    rule = next((r for r in rules if r.rule_id == rule_id), None)
+
+    if rule is None:
+        console.print(f"[red]✗ Rule not found: {rule_id}[/red]")
+        return
+
+    console.print(Panel.fit(f"Re-extracting rule: {rule.rule_text[:60]}...", style="bold blue"))
+
+    start = time.time()
+    final_state = reextract_rule(rule, query=query)
+    elapsed = time.time() - start
+
+    new_text = final_state.get("candidate_rule", "")
+    new_confidence = final_state.get("rule_confidence", 0.0)
+    new_status = final_state.get("verification_status", "unknown")
+    new_sources = len(final_state.get("source_refs", []))
+
+    # Side-by-side comparison
+    old_panel = Panel(
+        f"[bold]{rule.rule_text}[/bold]\n\n"
+        f"Confidence: [bold]{rule.confidence:.2f}[/bold]  |  "
+        f"Status: [bold]{rule.verification_status}[/bold]  |  "
+        f"Sources: {len(rule.source_refs)}  |  "
+        f"Version: {rule.version}",
+        title=f"Old Rule  (v{rule.version})",
+        border_style="dim",
+    )
+
+    status_colour = {
+        "verified": "green",
+        "needs_review": "yellow",
+        "rejected": "red",
+        "parse_failed": "red",
+    }.get(new_status, "white")
+
+    new_panel = Panel(
+        f"[bold]{new_text or '(no rule extracted)'}[/bold]\n\n"
+        f"Confidence: [bold]{new_confidence:.2f}[/bold]  |  "
+        f"Status: [bold {status_colour}]{new_status}[/bold {status_colour}]  |  "
+        f"Sources: {new_sources}  |  "
+        f"Time: {elapsed:.1f}s",
+        title="New Rule",
+        border_style=status_colour,
+    )
+
+    console.print()
+    console.print(old_panel)
+    console.print(new_panel)
+
+    if new_status in ("rejected", "parse_failed"):
+        console.print("\n[yellow]⚠ New extraction failed or was rejected. Keeping existing rule.[/yellow]")
+        return
+
+    if save:
+        should_replace = True
+    else:
+        should_replace = click.confirm("\nReplace existing rule with new version?")
+
+    if should_replace:
+        updates = {
+            "rule_text": new_text,
+            "confidence": new_confidence,
+            "verification_status": new_status,
+            "source_refs": [
+                {
+                    "chunk_id": s["chunk_id"],
+                    "source_type": s["source_type"],
+                    "channel": s.get("channel", ""),
+                    "timestamp": s.get("timestamp", ""),
+                    "excerpt": s.get("excerpt", ""),
+                }
+                for s in final_state.get("source_refs", [])
+            ],
+            "ambiguity_notes": f"Re-extracted from query: {query or rule.rule_text}",
+        }
+        updated = update_rule(rule_id, updates)
+        console.print(f"\n[green]✓ Updated to version {updated.version}[/green]")
+    else:
+        console.print("\n[dim]Kept existing rule. No changes made.[/dim]")
 
 
 # ---------------------------------------------------------------------------
@@ -963,6 +1122,28 @@ def status():
             pass
     else:
         console.print("  [dim]No rules extracted yet.[/dim]")
+
+
+# ---------------------------------------------------------------------------
+# export-skills
+# ---------------------------------------------------------------------------
+
+@cli.command("export-skills")
+@click.option("--output", default="rules/skills.json", show_default=True, help="Output JSON file path")
+@click.option("--dir", "rules_dir", default="rules/extracted/", show_default=True, help="Directory containing rule YAML files")
+def export_skills(output: str, rules_dir: str):
+    """Export verified, approved rules to skills.json"""
+    console.print(Panel.fit("Exporting Skills", style="bold blue"))
+
+    try:
+        path = export_skills_json(rules_dir=rules_dir, output_path=output)
+        # Load the file to report the count
+        import json
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        console.print(f"[green]✓ Exported {data['total_skills']} skill(s) to {path}[/green]")
+    except Exception as exc:
+        console.print(f"[red]✗ Export failed: {exc}[/red]")
 
 
 # ---------------------------------------------------------------------------

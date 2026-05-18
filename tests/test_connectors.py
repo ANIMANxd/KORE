@@ -19,6 +19,7 @@ _pyarrow.field = MagicMock(return_value=MagicMock())
 _pyarrow.string = MagicMock()
 _pyarrow.float32 = MagicMock()
 _pyarrow.list_ = MagicMock(return_value=MagicMock())
+_pyarrow.__version__ = "15.0.0"
 sys.modules["pyarrow"] = _pyarrow
 sys.modules["lancedb"] = types.ModuleType("lancedb")
 sys.modules["psycopg2"] = types.ModuleType("psycopg2")
@@ -339,7 +340,7 @@ class TestPgvectorBackend:
     @patch("storage.backends.pgvector_backend.psycopg2")
     @patch("providers.embedder.embed_text")
     @patch("providers.embedder.embed_batch")
-    @patch("providers.config.get_config")
+    @patch("storage.backends.pgvector_backend.get_config")
     def test_pgvector_backend_interface(
         self, mock_get_config, mock_embed_batch, mock_embed_text, mock_psycopg2
     ):
@@ -349,6 +350,10 @@ class TestPgvectorBackend:
         mock_get_config.return_value = MagicMock(
             embedding_dimensions=4,
             pgvector_url="postgresql://test:test@localhost/test",
+            embedding_provider="lmstudio",
+            embedding_model="test-embed",
+            embedding_api_key=None,
+            embedding_base_url="http://localhost:1234/v1",
         )
 
         mock_embed_batch.return_value = [

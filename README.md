@@ -2,7 +2,7 @@
 
 An AI-powered system that ingests fragmented company data from sources like Slack, Notion, GitHub, and Jira, extracts hidden business rules using LLM reasoning, and outputs structured, validated YAML/JSON skill files that AI agents can enforce reliably.
 
-**Phase**: Phase 3 (Real Connectors) - Complete. Vector store backend abstraction (LanceDB + pgvector) + live connectors for Slack, GitHub, Notion, and Jira.
+**Phase**: Phase 4 (Rule Lifecycle) — Contradiction detection complete. Vector store backend abstraction (LanceDB + pgvector) + live connectors for Slack, GitHub, Notion, and Jira all built.
 
 ---
 
@@ -80,6 +80,21 @@ LangGraph pipeline with conditional edges and loop guard:
 - **`nodes/extractor.py`** - LLM rule extraction via `complete_json()`. System prompt enforces JSON-only output. Confidence thresholds: <0.3 rejected, 0.3-0.6 needs_review.
 - **`nodes/verifier.py`** - LLM cross-check against source chunks. Detects contradictions. Can adjust rule text and confidence.
 - **`nodes/formatter.py`** - Pure formatting (no LLM). Builds validated `BusinessRule` Pydantic model with enriched source references.
+- **`contradiction_detector.py`** - Post-save rule lifecycle:
+  - `find_contradictions()` - Compares a new rule against all existing rules in the same category via LLM. Only same-category rules are checked.
+  - `ContradictionReport` dataclass - rule_id_a/b, rule_text_a/b, description, severity (high/medium/low), detected_at
+  - `save_contradiction_report()` / `load_contradiction_reports()` - YAML persistence to `rules/contradictions/`
+  - Auto-triggered after every `extract --save`. Prints red warning panel when conflicts found.
+  - Gracefully handles `JSONRepairFailed` during contradiction check (assumes no contradiction, logs warning)
+- **`expiry_detector.py`** - Rule staleness detection:
+  - `check_rule_expiry()` - Parses all source-ref timestamps, finds the most recent, and compares against a days threshold (default 90). Returns `ExpiryReport` or `None`.
+  - `scan_all_rules()` - Loads all rules and returns expired ones sorted by age descending.
+  - Supports multiple timestamp formats: ISO-8601, date-only, with/without timezone.
+- **`reextractor.py`** - Rule re-extraction engine:
+  - `find_affected_rules(new_chunk_ids, existing_rules)` - Computes overlap ratio between new chunk IDs and each rule's source_refs. Returns rule IDs where overlap ≥ threshold (default 0.85).
+  - `reextract_rule(rule, query=None)` - Re-runs the full LangGraph pipeline for an existing rule. Uses rule text as default query, or accepts a custom query.
+  - CLI: `python run.py reextract --rule-id <uuid>` shows old vs new side-by-side, prompts for replacement, auto-increments version.
+  - CLI: `python run.py check-expiry --days 90` prints a Rich table with rule excerpt, category, last referenced date, and days old.
 
 ### 6. Output Layer (`output/`)
 
@@ -92,6 +107,10 @@ LangGraph pipeline with conditional edges and loop guard:
   - `save_rule()` - writes `{timestamp}_{category}_{id}.yaml`
   - `load_rules()` - validates all YAML files against schema, skips invalid
   - `update_rule()` - finds by UUID, applies updates, increments version
+- **`skills_writer.py`** - Agent-facing export:
+  - `export_skills_json()` - Exports verified, human-approved rules to `skills.json`
+  - Only includes rules where `verification_status == "verified"` AND `approved_by is not None`
+  - Output format: `{version, generated_at, source, total_skills, skills[]}` with id, name, description, category, confidence, constraints, sources, approved, version
 
 ### 7. Full CLI (`run.py`)
 
@@ -115,6 +134,12 @@ python run.py ingest --source jira --live                  # Live Jira API
 # Extraction & review
 python run.py extract --query "refund policy" --save       # Full extraction pipeline
 python run.py review         # Interactive human review (approve/reject/edit)
+python run.py check-expiry   # Scan rules for staleness (default: >90 days)
+python run.py check-expiry --days 60 --dir rules/extracted/  # Custom threshold
+python run.py reextract --rule-id <uuid>                   # Re-extract an existing rule
+python run.py reextract --rule-id <uuid> --query "new phrasing"  # Custom query
+python run.py export-skills                               # Export approved rules to skills.json
+python run.py export-skills --output skills.json --dir rules/extracted/  # Custom paths
 
 # System
 python run.py status         # Rich dashboard (providers, chunks, rules, repair stats)
@@ -124,7 +149,7 @@ python run.py --verbose ...  # Enable debug logging on any command
 
 ### 8. Test Suite (`tests/`)
 
-43 tests, all passing. No real LLM calls or network requests in tests — everything mocked.
+92 tests, all passing. No real LLM calls or network requests in tests — everything mocked.
 
 - **`test_json_repair.py`** (5) - Repair loop, markdown fences, exhaustion, counter
 - **`test_chunker.py`** (7) - Slack windowing, GitHub code blocks, generic fallback
@@ -137,6 +162,26 @@ python run.py --verbose ...  # Enable debug logging on any command
   - LanceDB backend store/search with mocked PyArrow and lancedb
   - Pgvector backend interface with mocked psycopg2 and pgvector
   - Backend switching via config (LanceDB ↔ pgvector, invalid backend)
+- **`test_contradiction_detector.py`** (13) - Rule lifecycle contradiction detection:
+  - ContradictionReport dataclass creation and YAML round-trip
+  - No contradiction, contradiction found, same-category filtering, self-skip
+  - Graceful handling of JSONRepairFailed during check
+  - Multiple existing rules checked, invalid severity defaults to medium
+  - Save/load persistence and malformed file skipping
+- **`test_expiry_detector.py`** (15) - Rule staleness detection:
+  - Timestamp parsing (ISO-8601, offset, date-only, unparseable)
+  - Fresh rule returns None, stale rule returns ExpiryReport
+  - Most-recent timestamp used, no source refs handled gracefully
+  - scan_all_rules filtering, sorting by age descending, empty directory
+- **`test_reextractor.py`** (10) - Rule re-extraction:
+  - find_affected_rules: exact/partial overlap, threshold sensitivity, multiple rules
+  - Empty new chunks, rules with no source refs skipped
+  - reextract_rule: default query from rule text, custom query override
+- **`test_skills_writer.py`** (11) - Skills export:
+  - Source string formatting (channel + timestamp, channel-only, timestamp-only, fallback)
+  - Rule-to-skill conversion (id, name, description, category, confidence, constraints, sources, approved, version)
+  - Export filtering: only verified + approved_by rules included
+  - Empty export when no approved rules, ISO timestamp generated_at, nested directory creation
 
 Run: `pytest tests/ -v`
 
@@ -204,6 +249,9 @@ KORE/
 │   ├── __init__.py
 │   ├── state.py                 # TypedDict state definition
 │   ├── graph.py                 # Graph wiring and runner
+│   ├── contradiction_detector.py# Rule lifecycle: detect conflicting rules
+│   ├── expiry_detector.py       # Rule lifecycle: detect stale rules
+│   ├── reextractor.py           # Rule lifecycle: re-extract affected rules
 │   └── nodes/
 │       ├── retriever.py         # Vector similarity search
 │       ├── extractor.py         # LLM rule extraction
@@ -213,21 +261,28 @@ KORE/
 ├── output/                      # Schema validation and persistence
 │   ├── __init__.py
 │   ├── schema.py                # Pydantic v2 models
-│   └── writer.py                # YAML file writer/loader/updater
+│   ├── writer.py                # YAML file writer/loader/updater
+│   └── skills_writer.py         # skills.json export for agents
 │
-├── tests/                       # Test suite (32 tests, all passing)
+├── tests/                       # Test suite (92 tests, all passing)
 │   ├── __init__.py
 │   ├── test_json_repair.py
 │   ├── test_chunker.py
 │   ├── test_extractor.py
 │   ├── test_verifier.py
-│   └── test_schema.py
+│   ├── test_schema.py
+│   ├── test_connectors.py
+│   ├── test_contradiction_detector.py
+│   ├── test_expiry_detector.py
+│   ├── test_reextractor.py
+│   └── test_skills_writer.py
 │
 ├── data/
 │   └── sample/                  # Fake test data (Acme Corp Slack export)
 │
 └── rules/
-    └── extracted/               # Output YAML files (created at runtime)
+    ├── extracted/               # Output YAML files (created at runtime)
+    └── contradictions/          # Contradiction reports (created at runtime)
 ```
 
 ---
@@ -430,8 +485,8 @@ vector_store:
 
 ## What's Next (Phase 4)
 
-- **Rule lifecycle** — Contradiction detection, expiry detection, re-extraction triggers
-- **Skills export** — `skills.json` format for agent consumption
+- **Rule lifecycle** — ✅ Contradiction detection (complete), ✅ Expiry detection (complete), ✅ Re-extraction triggers (complete)
+- **Skills export** — ✅ `skills.json` format for agent consumption (complete)
 - **TUI** — Textual 8-screen terminal interface
 - **Licensing** — HMAC license keys, 14-day trial mode
 - **Binary distribution** — PyInstaller single-file build
