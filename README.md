@@ -2,7 +2,7 @@
 
 An AI-powered system that ingests fragmented company data from sources like Slack, Notion, GitHub, and Jira, extracts hidden business rules using LLM reasoning, and outputs structured, validated YAML/JSON skill files that AI agents can enforce reliably.
 
-**Phase**: Phase 4 (Rule Lifecycle) — Contradiction detection complete. Vector store backend abstraction (LanceDB + pgvector) + live connectors for Slack, GitHub, Notion, and Jira all built.
+**Phase**: Phase 12 (Agent Integration) — MCP server, context injector, Claude Code hooks, knowledge graph, and memory store all built. 205 tests, all passing.
 
 ---
 
@@ -36,20 +36,7 @@ Hybrid backend architecture — identical public interface regardless of backend
 
 **Backend selection** is read from `provider.config.yaml`. Switching backends is one config line.
 
-### 3. CLI Setup (`run.py`)
-
-Interactive configuration wizard using Click and Rich:
-
-```bash
-python run.py setup          # Interactive provider + vector store configuration
-python run.py slack-setup    # Interactive Slack bot setup (token, channels, test connection)
-python run.py github-setup   # Interactive GitHub setup (token, repo, branch, test connection)
-python run.py notion-setup   # Interactive Notion setup (integration token, test connection)
-python run.py jira-setup     # Interactive Jira setup (server, email, API token, project keys, test connection)
-python run.py status         # Show system status dashboard
-```
-
-### 4. Data Ingestion (`ingestion/`)
+### 3. Data Ingestion (`ingestion/`)
 
 - **`loader.py`** - Multi-source loader supporting local exports and live APIs:
   - **Slack (local export)**: Parses Slack export JSON directories into LlamaIndex `Document` objects
@@ -66,7 +53,7 @@ python run.py status         # Show system status dashboard
   - **Jira**: Field-based — description + individual comment chunks
   - **Generic**: `SentenceSplitter` fallback (512 tokens, 50 overlap)
 
-### 5. Extraction Engine (`engine/`)
+### 4. Extraction Engine (`engine/`)
 
 LangGraph pipeline with conditional edges and loop guard:
 
@@ -96,7 +83,37 @@ LangGraph pipeline with conditional edges and loop guard:
   - CLI: `python run.py reextract --rule-id <uuid>` shows old vs new side-by-side, prompts for replacement, auto-increments version.
   - CLI: `python run.py check-expiry --days 90` prints a Rich table with rule excerpt, category, last referenced date, and days old.
 
-### 6. Output Layer (`output/`)
+### 5. Knowledge Graph (`graph/`)
+
+Entity-relationship graph built from verified rules:
+
+- **`models.py`** - Pydantic v2 models:
+  - `Entity` — entity_id, entity_type (rule/team/process/system/policy/person_role/threshold/concept), name, description, source_rule_ids, mention_count, last_seen
+  - `Relationship` — relationship_id, from_entity_id, to_entity_id, relationship_type (governs/involves/depends_on/contradicts/supersedes/applies_to/triggers/owned_by), confidence, source_rule_ids
+  - `KnowledgeGraph` — entities dict, relationships list, to_json(), summary(), merge_entity(), get_related_entities()
+- **`entity_extractor.py`** - LLM-based entity extraction from business rules. Calls `complete_json()` with conservative extraction prompt. Fuzzy-matches against existing entities (85% threshold). Bumps mention_count on match.
+- **`store.py`** - Persistence and queries:
+  - `load_graph()` / `save_graph()` — atomic JSON write
+  - `get_entity_by_name()` — case-insensitive + fuzzy match
+  - `get_related_entities()` — BFS traversal with relationship type filter and max_hops
+  - `get_rules_for_entity()` — loads linked BusinessRule objects
+  - `search_graph()` — keyword + fuzzy search across names and descriptions
+  - `get_most_connected_entities()` — ranks by relationship degree
+
+### 6. Memory Store (`memory/`)
+
+Agent-accessible searchable index from verified rules and high-confidence graph entities:
+
+- **`store.py`** - MemoryEntry (Pydantic v2) with content, entry_type, embedding, confidence, freshness, access_count. MemoryStore container.
+  - `build_memory_store()` — loads verified rules + entities with mention_count > 2, generates embeddings, saves atomically
+  - `query_memory()` — cosine similarity search, increments access_count
+  - `build_context_for_agent()` — formats top-k results as clean context block with token truncation
+- **`decay.py`** - Freshness scoring:
+  - `calculate_freshness()` — exponential time decay + access boost, clamped [0, 1]
+  - `decay_sweep()` — recalculates all entries, saves if changed
+  - `get_freshness_summary()` — high/mid/low bucket counts
+
+### 7. Output Layer (`output/`)
 
 - **`schema.py`** - Pydantic v2 models:
   - `SourceRef` - chunk_id, source_type, channel, timestamp, excerpt (auto-truncated to 100 chars)
@@ -112,7 +129,41 @@ LangGraph pipeline with conditional edges and loop guard:
   - Only includes rules where `verification_status == "verified"` AND `approved_by is not None`
   - Output format: `{version, generated_at, source, total_skills, skills[]}` with id, name, description, category, confidence, constraints, sources, approved, version
 
-### 7. Full CLI (`run.py`)
+### 8. Agent Integration (`integrations/`)
+
+- **`mcp/server.py`** - Local MCP server (FastMCP) running on company infrastructure. Zero cloud dependency.
+  - `query_company_knowledge(query, max_results)` — similarity search over memory store
+  - `get_rule_by_category(category)` — filtered rule listing
+  - `check_action_against_rules(proposed_action)` — LLM compliance check with structured JSON output
+  - `get_company_context(task_description, max_tokens)` — formatted context block for agent consumption
+  - `list_all_rules(category)` — summary list with optional filtering
+- **`claude_code.py`** - Claude Code settings generator:
+  - `generate_claude_code_config()` — returns MCP server + pre_tool_use hook config
+  - `setup_claude_code()` — detects OS (Mac/Windows/Linux), reads existing settings, merges KORE config, writes back
+- **`hooks/pre_tool_use.py`** - Pre-flight compliance hook for Claude Code:
+  - Receives tool context via stdin, builds action description
+  - Checks against company rules via direct memory/LLM imports (no MCP round-trip)
+  - Prints violation warnings to stderr, always exits 0 (warn, never block)
+- **`context_injector.py`** - Generic agent context export:
+  - `generate_system_prompt_injection(task_domain, max_tokens, output_format)` — queries memory, formats as markdown/xml/plain
+  - `export_context_file()` — writes context block to disk
+
+### 9. TUI (`ui/tui.py`)
+
+Textual-based 8-screen terminal interface:
+
+- **Dashboard** — Stat cards (chunks, rules, verified, needs_review, entities), vector store info, top entities, rules by category, recent extractions
+- **Extract** — Query input with live log output showing pipeline progress, JSON repair notifications, result panel with save/discard
+- **Review Queue** — DataTable of `needs_review` rules with expand-on-enter, action bar for approve/reject/edit/skip
+- **All Rules** — Filterable DataTable by status/category, detail view on enter, re-extract and delete with confirmation modals
+- **Ingest** — Source selector (Slack/GitHub/Notion/Jira), mode toggle (local export vs live API), credential status check, progress log with summary
+- **Settings** — Provider config display, test connection buttons (LLM/embedding/vector store), license info panel with days remaining, reconfigure hint
+- **Knowledge Graph** — Entity browser (40%) with searchable DataTable grouped by type. Detail panel (60%) with name, type, description, mentions/last_seen, connected rules, related entities with relationship type + confidence (1-hop), 2-hop relationships. Shortcuts: `/`=search, `R`=related rules, `G`=expand hop, `Esc`=back
+- **Agent Memory** — Stat cards (total/fresh/stale/last built), memory entry browser with freshness bar, entry detail. Action buttons: Build Memory (`b`), Decay Sweep (`d`), Start MCP Server (`s`). MCP status indicator in header.
+
+Keyboard shortcuts: `q`=quit, `Tab`/`Shift+Tab`=next/prev screen, `?`=help, `Esc`=back
+
+### 10. Full CLI (`run.py`)
 
 All commands built with Click + Rich:
 
@@ -141,51 +192,53 @@ python run.py reextract --rule-id <uuid> --query "new phrasing"  # Custom query
 python run.py export-skills                               # Export approved rules to skills.json
 python run.py export-skills --output skills.json --dir rules/extracted/  # Custom paths
 
+# Knowledge Graph
+python run.py graph-stats    # Show entity counts, types, top connected entities
+
+# Memory Store
+python run.py build-memory   # Build memory store from rules + graph
+python run.py decay-sweep    # Run freshness decay sweep over memory store
+
+# Agent Integration
+python run.py mcp-server --port 3333                      # Start local MCP server
+python run.py setup-claude-code --port 3333               # Configure Claude Code integration
+python run.py export-context --domain "refund policy"    # Export context block for agents
+
+# TUI
+python run.py tui              # Launch Textual terminal interface
+
 # System
 python run.py status         # Rich dashboard (providers, chunks, rules, repair stats)
 python run.py reset-db       # Drop and recreate vector store
 python run.py --verbose ...  # Enable debug logging on any command
 ```
 
-### 8. Test Suite (`tests/`)
+### 11. Test Suite (`tests/`)
 
-92 tests, all passing. No real LLM calls or network requests in tests — everything mocked.
+205 tests, all passing. No real LLM calls or network requests in tests — everything mocked.
 
 - **`test_json_repair.py`** (5) - Repair loop, markdown fences, exhaustion, counter
 - **`test_chunker.py`** (7) - Slack windowing, GitHub code blocks, generic fallback
 - **`test_extractor.py`** (5) - Success, parse_failed, confidence thresholds, meta
 - **`test_verifier.py`** (6) - Verified, rejected, contradictions, adjusted text
 - **`test_schema.py`** (9) - Pydantic validations, excerpt truncation, YAML round-trip
-- **`test_connectors.py`** (11) - All data sources and vector store backends mocked:
-  - Slack, GitHub, Notion, Jira loader metadata and routing
-  - Source-aware chunker selection (GitHub, Jira)
-  - LanceDB backend store/search with mocked PyArrow and lancedb
-  - Pgvector backend interface with mocked psycopg2 and pgvector
-  - Backend switching via config (LanceDB ↔ pgvector, invalid backend)
-- **`test_contradiction_detector.py`** (13) - Rule lifecycle contradiction detection:
-  - ContradictionReport dataclass creation and YAML round-trip
-  - No contradiction, contradiction found, same-category filtering, self-skip
-  - Graceful handling of JSONRepairFailed during check
-  - Multiple existing rules checked, invalid severity defaults to medium
-  - Save/load persistence and malformed file skipping
-- **`test_expiry_detector.py`** (15) - Rule staleness detection:
-  - Timestamp parsing (ISO-8601, offset, date-only, unparseable)
-  - Fresh rule returns None, stale rule returns ExpiryReport
-  - Most-recent timestamp used, no source refs handled gracefully
-  - scan_all_rules filtering, sorting by age descending, empty directory
-- **`test_reextractor.py`** (10) - Rule re-extraction:
-  - find_affected_rules: exact/partial overlap, threshold sensitivity, multiple rules
-  - Empty new chunks, rules with no source refs skipped
-  - reextract_rule: default query from rule text, custom query override
-- **`test_skills_writer.py`** (11) - Skills export:
-  - Source string formatting (channel + timestamp, channel-only, timestamp-only, fallback)
-  - Rule-to-skill conversion (id, name, description, category, confidence, constraints, sources, approved, version)
-  - Export filtering: only verified + approved_by rules included
-  - Empty export when no approved rules, ISO timestamp generated_at, nested directory creation
+- **`test_connectors.py`** (33) - All data sources, vector store backends, and document ingestion mocked
+- **`test_contradiction_detector.py`** (13) - Rule lifecycle contradiction detection
+- **`test_expiry_detector.py`** (15) - Rule staleness detection
+- **`test_reextractor.py`** (10) - Rule re-extraction
+- **`test_skills_writer.py`** (11) - Skills export
+- **`test_graph_store.py`** (23) - Graph persistence, fuzzy search, BFS traversal, rule linking, most connected
+- **`test_entity_extractor.py`** (12) - Entity extraction, fuzzy matching, mention bumping
+- **`test_memory_store.py`** (23) - Memory entry defaults, build from rules+entities, query ranking, context formatting
+- **`test_memory_decay.py`** (15) - Freshness calculation, decay sweep, summary buckets
+- **`test_mcp_server.py`** (14) - MCP tools: query knowledge, get rules, check action, get context, list rules
+- **`test_claude_code_integration.py`** (12) - Config generation, settings merge, OS detection
+- **`test_pre_tool_use_hook.py`** (14) - Action description building, compliance check, violation warnings
+- **`test_context_injector.py`** (14) - Markdown/XML/plain formatters, prompt injection, file export
 
 Run: `pytest tests/ -v`
 
-### 9. Test Data (`data/sample/`)
+### 12. Test Data (`data/sample/`)
 
 Fake Slack export for "Acme Corp" (50-person startup):
 - 3 channels: `#engineering`, `#ops`, `#customer-success`
@@ -209,6 +262,8 @@ Fake Slack export for "Acme Corp" (50-person startup):
 | **Orchestration** | LangGraph | Stateful reasoning pipeline with repair loops |
 | **Schema Validation** | Pydantic v2 | Output rule validation |
 | **CLI** | Click + Rich | Interactive setup and status commands |
+| **TUI** | Textual | 8-screen terminal interface |
+| **MCP Server** | Anthropic MCP Python SDK (FastMCP) | Local Model Context Protocol server for agent integration |
 | **Config** | PyYAML + python-dotenv | Provider config and environment variables |
 | **JSON Repair** | `json` + `json5` + `demjson3` | Lenient parsing for local model failures |
 
@@ -258,13 +313,37 @@ KORE/
 │       ├── verifier.py          # LLM cross-check
 │       └── formatter.py         # Pydantic formatting
 │
+├── graph/                       # Knowledge graph (entities, relationships)
+│   ├── __init__.py
+│   ├── models.py                # Entity, Relationship, KnowledgeGraph models
+│   ├── entity_extractor.py      # LLM-based entity extraction
+│   └── store.py                 # Persistence and queries
+│
+├── memory/                      # Agent memory store
+│   ├── __init__.py
+│   ├── store.py                 # MemoryEntry, MemoryStore, build/query/context
+│   └── decay.py                 # Freshness scoring and decay sweep
+│
+├── mcp/                         # Model Context Protocol server
+│   └── server.py                # FastMCP server with 5 tools
+│
+├── integrations/                # Agent integrations
+│   ├── __init__.py
+│   ├── claude_code.py           # Claude Code config generator
+│   ├── context_injector.py      # Generic agent context export
+│   └── hooks/
+│       └── pre_tool_use.py      # Claude Code pre-tool-use hook
+│
 ├── output/                      # Schema validation and persistence
 │   ├── __init__.py
 │   ├── schema.py                # Pydantic v2 models
 │   ├── writer.py                # YAML file writer/loader/updater
 │   └── skills_writer.py         # skills.json export for agents
 │
-├── tests/                       # Test suite (92 tests, all passing)
+├── ui/                          # Textual TUI (8 screens)
+│   └── tui.py                   # KoreApp with tabbed screens
+│
+├── tests/                       # Test suite (205 tests, all passing)
 │   ├── __init__.py
 │   ├── test_json_repair.py
 │   ├── test_chunker.py
@@ -275,7 +354,15 @@ KORE/
 │   ├── test_contradiction_detector.py
 │   ├── test_expiry_detector.py
 │   ├── test_reextractor.py
-│   └── test_skills_writer.py
+│   ├── test_skills_writer.py
+│   ├── test_graph_store.py
+│   ├── test_entity_extractor.py
+│   ├── test_memory_store.py
+│   ├── test_memory_decay.py
+│   ├── test_mcp_server.py
+│   ├── test_claude_code_integration.py
+│   ├── test_pre_tool_use_hook.py
+│   └── test_context_injector.py
 │
 ├── data/
 │   └── sample/                  # Fake test data (Acme Corp Slack export)
@@ -480,16 +567,15 @@ vector_store:
 - **Ollama embeddings use direct HTTP** instead of LiteLLM for reliability (`/api/embeddings` endpoint).
 - **GithubRepositoryReader traverses git tree per-directory** (no recursive API flag). Large monorepos need `filter_directories` exclusion list. `node_modules`, `.git`, `__pycache__`, `dist`, `build`, `venv`, etc. are excluded by default.
 - **LanceDB uses `to_pandas()` for dedup** — acceptable for on-premise scale, may need optimisation for 100k+ chunks.
+- **mcp/server.py is loaded via `importlib.util`** in `run.py` to avoid namespace conflict with the installed `mcp` SDK package.
 
 ---
 
-## What's Next (Phase 4)
+## What's Next
 
-- **Rule lifecycle** — ✅ Contradiction detection (complete), ✅ Expiry detection (complete), ✅ Re-extraction triggers (complete)
-- **Skills export** — ✅ `skills.json` format for agent consumption (complete)
-- **TUI** — Textual 8-screen terminal interface
 - **Licensing** — HMAC license keys, 14-day trial mode
 - **Binary distribution** — PyInstaller single-file build
+- **Additional data sources** — Teams, Confluence, Linear, Zendesk, Google Drive
 
 ---
 

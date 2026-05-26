@@ -1,0 +1,807 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>KORE Test Suite Coverage Report</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            background: #0d1117;
+            color: #c9d1d9;
+            line-height: 1.6;
+            padding: 2rem;
+        }
+        
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        
+        header {
+            text-align: center;
+            padding: 2rem 0;
+            border-bottom: 1px solid #30363d;
+            margin-bottom: 2rem;
+        }
+        
+        h1 {
+            font-size: 2.5rem;
+            color: #58a6ff;
+            margin-bottom: 0.5rem;
+        }
+        
+        .subtitle {
+            color: #8b949e;
+            font-size: 1.1rem;
+        }
+        
+        .overall-score {
+            display: flex;
+            justify-content: center;
+            gap: 2rem;
+            margin: 2rem 0;
+            flex-wrap: wrap;
+        }
+        
+        .score-card {
+            background: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 12px;
+            padding: 1.5rem 2rem;
+            text-align: center;
+            min-width: 200px;
+        }
+        
+        .score-number {
+            font-size: 3rem;
+            font-weight: bold;
+            color: #58a6ff;
+        }
+        
+        .score-label {
+            color: #8b949e;
+            font-size: 0.9rem;
+            margin-top: 0.5rem;
+        }
+        
+        .section {
+            margin: 2rem 0;
+            background: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 12px;
+            overflow: hidden;
+        }
+        
+        .section-header {
+            background: #21262d;
+            padding: 1rem 1.5rem;
+            border-bottom: 1px solid #30363d;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        .section-header h2 {
+            color: #58a6ff;
+            font-size: 1.3rem;
+        }
+        
+        .coverage-badge {
+            background: #238636;
+            color: white;
+            padding: 0.3rem 0.8rem;
+            border-radius: 20px;
+            font-size: 0.9rem;
+            font-weight: bold;
+        }
+        
+        .coverage-badge.good {
+            background: #238636;
+        }
+        
+        .coverage-badge.medium {
+            background: #d29922;
+        }
+        
+        .coverage-badge.poor {
+            background: #da3633;
+        }
+        
+        .section-content {
+            padding: 1.5rem;
+        }
+        
+        .test-list {
+            list-style: none;
+        }
+        
+        .test-list li {
+            padding: 0.5rem 0;
+            padding-left: 1.5rem;
+            position: relative;
+        }
+        
+        .test-list li::before {
+            content: "✓";
+            position: absolute;
+            left: 0;
+            color: #3fb950;
+        }
+        
+        .test-list li.missed::before {
+            content: "✗";
+            color: #f85149;
+        }
+        
+        .test-list li.missed {
+            color: #f85149;
+        }
+        
+        .module-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 1rem;
+        }
+        
+        .module-table th {
+            background: #21262d;
+            padding: 0.8rem;
+            text-align: left;
+            color: #58a6ff;
+            font-weight: 600;
+            border-bottom: 2px solid #30363d;
+        }
+        
+        .module-table td {
+            padding: 0.8rem;
+            border-bottom: 1px solid #21262d;
+        }
+        
+        .module-table tr:hover {
+            background: #1c2128;
+        }
+        
+        .bar-container {
+            width: 100%;
+            height: 24px;
+            background: #21262d;
+            border-radius: 12px;
+            overflow: hidden;
+            position: relative;
+        }
+        
+        .bar-fill {
+            height: 100%;
+            border-radius: 12px;
+            transition: width 0.3s ease;
+        }
+        
+        .bar-fill.good {
+            background: linear-gradient(90deg, #238636, #2ea043);
+        }
+        
+        .bar-fill.medium {
+            background: linear-gradient(90deg, #d29922, #e3b341);
+        }
+        
+        .bar-fill.poor {
+            background: linear-gradient(90deg, #da3633, #f85149);
+        }
+        
+        .bar-text {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            font-size: 0.85rem;
+            font-weight: bold;
+            color: white;
+            text-shadow: 0 1px 2px rgba(0,0,0,0.5);
+        }
+        
+        .gap-section {
+            margin: 2rem 0;
+        }
+        
+        .gap-card {
+            background: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 8px;
+            padding: 1rem;
+            margin: 0.5rem 0;
+            border-left: 4px solid #da3633;
+        }
+        
+        .gap-card.medium-gap {
+            border-left-color: #d29922;
+        }
+        
+        .gap-card h3 {
+            color: #f85149;
+            margin-bottom: 0.5rem;
+        }
+        
+        .gap-card.medium-gap h3 {
+            color: #e3b341;
+        }
+        
+        .gap-card p {
+            color: #8b949e;
+            font-size: 0.95rem;
+        }
+        
+        .summary-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 1rem;
+            margin: 2rem 0;
+        }
+        
+        .summary-card {
+            background: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 8px;
+            padding: 1.5rem;
+        }
+        
+        .summary-card h3 {
+            color: #58a6ff;
+            margin-bottom: 0.5rem;
+            font-size: 1rem;
+        }
+        
+        .summary-card .percentage {
+            font-size: 2rem;
+            font-weight: bold;
+            margin: 0.5rem 0;
+        }
+        
+        .summary-card.good .percentage {
+            color: #3fb950;
+        }
+        
+        .summary-card.medium .percentage {
+            color: #e3b341;
+        }
+        
+        .summary-card.poor .percentage {
+            color: #f85149;
+        }
+        
+        .summary-card p {
+            color: #8b949e;
+            font-size: 0.9rem;
+        }
+        
+        footer {
+            text-align: center;
+            padding: 2rem;
+            color: #8b949e;
+            border-top: 1px solid #30363d;
+            margin-top: 2rem;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>KORE Test Suite Coverage Report</h1>
+            <p class="subtitle">114 tests passing | Generated with pytest-cov</p>
+        </header>
+        
+        <div class="overall-score">
+            <div class="score-card">
+                <div class="score-number">65%</div>
+                <div class="score-label">Overall Coverage</div>
+            </div>
+            <div class="score-card">
+                <div class="score-number">114</div>
+                <div class="score-label">Tests Passing</div>
+            </div>
+            <div class="score-card">
+                <div class="score-number">0</div>
+                <div class="score-label">Tests Failing</div>
+            </div>
+            <div class="score-card">
+                <div class="score-number">4,652</div>
+                <div class="score-label">Total Statements</div>
+            </div>
+        </div>
+        
+        <div class="summary-grid">
+            <div class="summary-card good">
+                <h3>Rule Lifecycle</h3>
+                <div class="percentage">92-100%</div>
+                <p>Extraction, verification, contradiction, expiry, re-extraction</p>
+            </div>
+            <div class="summary-card good">
+                <h3>Schema + Serialization</h3>
+                <div class="percentage">82-100%</div>
+                <p>Pydantic models, skills export, YAML validation</p>
+            </div>
+            <div class="summary-card medium">
+                <h3>Data Ingestion</h3>
+                <div class="percentage">58-63%</div>
+                <p>Connectors and chunkers. Interactive setup flows untested</p>
+            </div>
+            <div class="summary-card medium">
+                <h3>Vector Store</h3>
+                <div class="percentage">60%</div>
+                <p>LanceDB + pgvector backends. Some error paths missed</p>
+            </div>
+            <div class="summary-card poor">
+                <h3>CLI (run.py)</h3>
+                <div class="percentage">0%</div>
+                <p>All 620 statements untested. Biggest gap.</p>
+            </div>
+            <div class="summary-card poor">
+                <h3>LangGraph Pipeline</h3>
+                <div class="percentage">19-54%</div>
+                <p>Nodes tested individually, not wired together</p>
+            </div>
+        </div>
+        
+        <div class="section">
+            <div class="section-header">
+                <h2>Test Suite Details</h2>
+            </div>
+            <div class="section-content">
+                <table class="module-table">
+                    <thead>
+                        <tr>
+                            <th>Test Suite</th>
+                            <th>Statements</th>
+                            <th>Missed</th>
+                            <th>Coverage</th>
+                            <th>Visual</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td><strong>tests/test_connectors.py</strong></td>
+                            <td>541</td>
+                            <td>3</td>
+                            <td><span class="coverage-badge good">99%</span></td>
+                            <td>
+                                <div class="bar-container">
+                                    <div class="bar-fill good" style="width: 99%"></div>
+                                    <span class="bar-text">99%</span>
+                                </div>
+                            </td>
+                        </tr>
+                        <tr>
+                            <td><strong>tests/test_skills_writer.py</strong></td>
+                            <td>106</td>
+                            <td>0</td>
+                            <td><span class="coverage-badge good">100%</span></td>
+                            <td>
+                                <div class="bar-container">
+                                    <div class="bar-fill good" style="width: 100%"></div>
+                                    <span class="bar-text">100%</span>
+                                </div>
+                            </td>
+                        </tr>
+                        <tr>
+                            <td><strong>tests/test_contradiction_detector.py</strong></td>
+                            <td>136</td>
+                            <td>0</td>
+                            <td><span class="coverage-badge good">100%</span></td>
+                            <td>
+                                <div class="bar-container">
+                                    <div class="bar-fill good" style="width: 100%"></div>
+                                    <span class="bar-text">100%</span>
+                                </div>
+                            </td>
+                        </tr>
+                        <tr>
+                            <td><strong>tests/test_expiry_detector.py</strong></td>
+                            <td>118</td>
+                            <td>0</td>
+                            <td><span class="coverage-badge good">100%</span></td>
+                            <td>
+                                <div class="bar-container">
+                                    <div class="bar-fill good" style="width: 100%"></div>
+                                    <span class="bar-text">100%</span>
+                                </div>
+                            </td>
+                        </tr>
+                        <tr>
+                            <td><strong>tests/test_extractor.py</strong></td>
+                            <td>57</td>
+                            <td>0</td>
+                            <td><span class="coverage-badge good">100%</span></td>
+                            <td>
+                                <div class="bar-container">
+                                    <div class="bar-fill good" style="width: 100%"></div>
+                                    <span class="bar-text">100%</span>
+                                </div>
+                            </td>
+                        </tr>
+                        <tr>
+                            <td><strong>tests/test_json_repair.py</strong></td>
+                            <td>40</td>
+                            <td>0</td>
+                            <td><span class="coverage-badge good">100%</span></td>
+                            <td>
+                                <div class="bar-container">
+                                    <div class="bar-fill good" style="width: 100%"></div>
+                                    <span class="bar-text">100%</span>
+                                </div>
+                            </td>
+                        </tr>
+                        <tr>
+                            <td><strong>tests/test_reextractor.py</strong></td>
+                            <td>91</td>
+                            <td>0</td>
+                            <td><span class="coverage-badge good">100%</span></td>
+                            <td>
+                                <div class="bar-container">
+                                    <div class="bar-fill good" style="width: 100%"></div>
+                                    <span class="bar-text">100%</span>
+                                </div>
+                            </td>
+                        </tr>
+                        <tr>
+                            <td><strong>tests/test_schema.py</strong></td>
+                            <td>51</td>
+                            <td>0</td>
+                            <td><span class="coverage-badge good">100%</span></td>
+                            <td>
+                                <div class="bar-container">
+                                    <div class="bar-fill good" style="width: 100%"></div>
+                                    <span class="bar-text">100%</span>
+                                </div>
+                            </td>
+                        </tr>
+                        <tr>
+                            <td><strong>tests/test_verifier.py</strong></td>
+                            <td>61</td>
+                            <td>0</td>
+                            <td><span class="coverage-badge good">100%</span></td>
+                            <td>
+                                <div class="bar-container">
+                                    <div class="bar-fill good" style="width: 100%"></div>
+                                    <span class="bar-text">100%</span>
+                                </div>
+                            </td>
+                        </tr>
+                        <tr>
+                            <td><strong>tests/test_chunker.py</strong></td>
+                            <td>59</td>
+                            <td>0</td>
+                            <td><span class="coverage-badge good">100%</span></td>
+                            <td>
+                                <div class="bar-container">
+                                    <div class="bar-fill good" style="width: 100%"></div>
+                                    <span class="bar-text">100%</span>
+                                </div>
+                            </td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+        
+        <div class="section">
+            <div class="section-header">
+                <h2>What Each Test Suite Covers</h2>
+            </div>
+            <div class="section-content">
+                <h3 style="color: #58a6ff; margin: 1rem 0;">tests/test_connectors.py (99%)</h3>
+                <ul class="test-list">
+                    <li>Slack live loader — missing token raises RuntimeError with helpful message</li>
+                    <li>GitHub loader — mocked GithubRepositoryReader + GitHubRepositoryIssuesReader, metadata enrichment (source_type="github", repo, branch)</li>
+                    <li>Notion loader — mocked NotionPageReader, metadata enrichment (source_type="notion", page_id)</li>
+                    <li>Jira loader — mocked JiraReader, metadata enrichment (source_type="jira", ticket_id, status, assignee)</li>
+                    <li>Teams loader (3 tests) — missing credentials prompts setup, OAuth2 token exchange, Graph API message fetching, metadata fields (source_type="teams", team_id, channel_name, timestamp, user_id)</li>
+                    <li>Confluence loader (3 tests) — missing credentials prompts setup, ConfluenceReader metadata (source_type="confluence", space_key, page_title, page_id), heading-aware chunking</li>
+                    <li>Linear loader (2 tests) — GraphQL API mocking, metadata (source_type="linear", team_name, issue_id, status, assignee), chunker preserves issue_id + team_name</li>
+                    <li>Zendesk loader (3 tests) — REST API macros + ZendeskReader articles, doc_type in metadata (macro/ticket/article), macro = single chunk, ticket splits body + comments</li>
+                    <li>Google Drive loader (2 tests) — GoogleDriveReader metadata (source_type="google_drive", file_id, file_name, mime_type), missing credentials prompts setup</li>
+                    <li>Document loader (9 tests) — PDF extraction (pypdf.PdfReader mocked), DOCX extraction (docx.Document mocked), markdown read, unsupported file skip, recursive directory scan with excluded dirs (node_modules, .git, etc.), image-only PDF skip with warning, policy filename detection (likely_explicit_policy=True on policy/procedure/handbook filenames), PDF chunker by page, DOCX chunker by heading</li>
+                    <li>Vector store backends (4 tests) — LanceDB store/search with mocked PyArrow, pgvector interface with mocked psycopg2, backend switching via config (lancedb ↔ pgvector), invalid backend raises ValueError</li>
+                    <li>Chunker routing (2 tests) — GitHub heading-boundary chunking, Jira field-based chunking (description + comments)</li>
+                    <li class="missed">Missed: Narrow branch in TestDocumentLoader helper methods (lines 812–815)</li>
+                </ul>
+                
+                <h3 style="color: #58a6ff; margin: 1.5rem 0 1rem;">tests/test_skills_writer.py (100%)</h3>
+                <ul class="test-list">
+                    <li>export_skills_json() — exports verified + approved rules to skills.json</li>
+                    <li>_build_source_string() — channel + timestamp, channel-only, timestamp-only, fallback to chunk_id</li>
+                    <li>_rule_to_skill() — conversion: id, name, description, category, confidence, constraints, sources, approved, version</li>
+                    <li>Filtering: only verified + approved_by rules included</li>
+                    <li>Empty export when no approved rules</li>
+                    <li>ISO timestamp generated_at</li>
+                    <li>Nested directory creation</li>
+                </ul>
+                
+                <h3 style="color: #58a6ff; margin: 1.5rem 0 1rem;">tests/test_contradiction_detector.py (100%)</h3>
+                <ul class="test-list">
+                    <li>ContradictionReport dataclass creation and YAML round-trip</li>
+                    <li>No contradiction found</li>
+                    <li>Contradiction found between two rules</li>
+                    <li>Same-category filtering</li>
+                    <li>Self-skip (rule doesn't contradict itself)</li>
+                    <li>Graceful handling of JSONRepairFailed during check</li>
+                    <li>Multiple existing rules checked</li>
+                    <li>Invalid severity defaults to medium</li>
+                    <li>Save/load persistence</li>
+                    <li>Malformed file skipping</li>
+                </ul>
+                
+                <h3 style="color: #58a6ff; margin: 1.5rem 0 1rem;">tests/test_expiry_detector.py (100%)</h3>
+                <ul class="test-list">
+                    <li>Timestamp parsing: ISO-8601, offset, date-only, unparseable</li>
+                    <li>Fresh rule returns None</li>
+                    <li>Stale rule returns ExpiryReport</li>
+                    <li>Most-recent timestamp used</li>
+                    <li>No source refs handled gracefully</li>
+                    <li>scan_all_rules: filtering, sorting by age descending, empty directory</li>
+                </ul>
+                
+                <h3 style="color: #58a6ff; margin: 1.5rem 0 1rem;">tests/test_extractor.py (100%)</h3>
+                <ul class="test-list">
+                    <li>Success path: rule extracted with confidence > threshold</li>
+                    <li>parse_failed path: unparseable JSON</li>
+                    <li>Confidence thresholds: below MIN_CONFIDENCE_THRESHOLD → rejected</li>
+                    <li>Extraction metadata populated (provider, model, repair attempts)</li>
+                </ul>
+                
+                <h3 style="color: #58a6ff; margin: 1.5rem 0 1rem;">tests/test_json_repair.py (100%)</h3>
+                <ul class="test-list">
+                    <li>JSON repair loop: valid JSON passes through</li>
+                    <li>Markdown code fences stripped</li>
+                    <li>Exhaustion: after MAX_JSON_RETRIES attempts, returns parse_failed</li>
+                    <li>Repair counter increments correctly</li>
+                </ul>
+                
+                <h3 style="color: #58a6ff; margin: 1.5rem 0 1rem;">tests/test_reextractor.py (100%)</h3>
+                <ul class="test-list">
+                    <li>find_affected_rules(): exact overlap, partial overlap, threshold sensitivity, multiple rules</li>
+                    <li>Empty new chunks handled gracefully</li>
+                    <li>Rules with no source refs skipped</li>
+                    <li>reextract_rule(): default query from rule text, custom query override</li>
+                </ul>
+                
+                <h3 style="color: #58a6ff; margin: 1.5rem 0 1rem;">tests/test_schema.py (100%)</h3>
+                <ul class="test-list">
+                    <li>Pydantic v2 validations: required fields, UUID format, confidence range</li>
+                    <li>Excerpt truncation</li>
+                    <li>YAML round-trip (save → load → compare)</li>
+                    <li>ExtractionMeta and SourceRef models</li>
+                </ul>
+                
+                <h3 style="color: #58a6ff; margin: 1.5rem 0 1rem;">tests/test_verifier.py (100%)</h3>
+                <ul class="test-list">
+                    <li>Verified status: confidence ≥ threshold, no contradictions</li>
+                    <li>Rejected status: confidence below threshold</li>
+                    <li>Contradictions detected with existing rules</li>
+                    <li>Adjusted text: verifier modifies rule wording</li>
+                </ul>
+                
+                <h3 style="color: #58a6ff; margin: 1.5rem 0 1rem;">tests/test_chunker.py (100%)</h3>
+                <ul class="test-list">
+                    <li>Slack windowing: 15-minute time windows group messages correctly</li>
+                    <li>GitHub code block awareness: code fences kept intact</li>
+                    <li>Generic fallback: SentenceSplitter used for unknown source types</li>
+                    <li>Heading boundary detection for markdown</li>
+                </ul>
+            </div>
+        </div>
+        
+        <div class="section">
+            <div class="section-header">
+                <h2>Application Code Coverage Gaps</h2>
+            </div>
+            <div class="section-content">
+                <table class="module-table">
+                    <thead>
+                        <tr>
+                            <th>Module</th>
+                            <th>Statements</th>
+                            <th>Missed</th>
+                            <th>Coverage</th>
+                            <th>Visual</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td><strong>run.py</strong></td>
+                            <td>620</td>
+                            <td>620</td>
+                            <td><span class="coverage-badge poor">0%</span></td>
+                            <td>
+                                <div class="bar-container">
+                                    <div class="bar-fill poor" style="width: 0%"></div>
+                                    <span class="bar-text">0%</span>
+                                </div>
+                            </td>
+                        </tr>
+                        <tr>
+                            <td><strong>ingestion/loader.py</strong></td>
+                            <td>902</td>
+                            <td>383</td>
+                            <td><span class="coverage-badge medium">58%</span></td>
+                            <td>
+                                <div class="bar-container">
+                                    <div class="bar-fill medium" style="width: 58%"></div>
+                                    <span class="bar-text">58%</span>
+                                </div>
+                            </td>
+                        </tr>
+                        <tr>
+                            <td><strong>ingestion/chunker.py</strong></td>
+                            <td>600</td>
+                            <td>221</td>
+                            <td><span class="coverage-badge medium">63%</span></td>
+                            <td>
+                                <div class="bar-container">
+                                    <div class="bar-fill medium" style="width: 63%"></div>
+                                    <span class="bar-text">63%</span>
+                                </div>
+                            </td>
+                        </tr>
+                        <tr>
+                            <td><strong>providers/llm.py</strong></td>
+                            <td>127</td>
+                            <td>55</td>
+                            <td><span class="coverage-badge medium">57%</span></td>
+                            <td>
+                                <div class="bar-container">
+                                    <div class="bar-fill medium" style="width: 57%"></div>
+                                    <span class="bar-text">57%</span>
+                                </div>
+                            </td>
+                        </tr>
+                        <tr>
+                            <td><strong>providers/embedder.py</strong></td>
+                            <td>114</td>
+                            <td>68</td>
+                            <td><span class="coverage-badge medium">40%</span></td>
+                            <td>
+                                <div class="bar-container">
+                                    <div class="bar-fill medium" style="width: 40%"></div>
+                                    <span class="bar-text">40%</span>
+                                </div>
+                            </td>
+                        </tr>
+                        <tr>
+                            <td><strong>engine/graph.py</strong></td>
+                            <td>52</td>
+                            <td>24</td>
+                            <td><span class="coverage-badge medium">54%</span></td>
+                            <td>
+                                <div class="bar-container">
+                                    <div class="bar-fill medium" style="width: 54%"></div>
+                                    <span class="bar-text">54%</span>
+                                </div>
+                            </td>
+                        </tr>
+                        <tr>
+                            <td><strong>engine/nodes/formatter.py</strong></td>
+                            <td>21</td>
+                            <td>17</td>
+                            <td><span class="coverage-badge poor">19%</span></td>
+                            <td>
+                                <div class="bar-container">
+                                    <div class="bar-fill poor" style="width: 19%"></div>
+                                    <span class="bar-text">19%</span>
+                                </div>
+                            </td>
+                        </tr>
+                        <tr>
+                            <td><strong>engine/nodes/retriever.py</strong></td>
+                            <td>18</td>
+                            <td>14</td>
+                            <td><span class="coverage-badge poor">22%</span></td>
+                            <td>
+                                <div class="bar-container">
+                                    <div class="bar-fill poor" style="width: 22%"></div>
+                                    <span class="bar-text">22%</span>
+                                </div>
+                            </td>
+                        </tr>
+                        <tr>
+                            <td><strong>output/writer.py</strong></td>
+                            <td>67</td>
+                            <td>55</td>
+                            <td><span class="coverage-badge poor">18%</span></td>
+                            <td>
+                                <div class="bar-container">
+                                    <div class="bar-fill poor" style="width: 18%"></div>
+                                    <span class="bar-text">18%</span>
+                                </div>
+                            </td>
+                        </tr>
+                        <tr>
+                            <td><strong>storage/backends/lancedb_backend.py</strong></td>
+                            <td>163</td>
+                            <td>65</td>
+                            <td><span class="coverage-badge medium">60%</span></td>
+                            <td>
+                                <div class="bar-container">
+                                    <div class="bar-fill medium" style="width: 60%"></div>
+                                    <span class="bar-text">60%</span>
+                                </div>
+                            </td>
+                        </tr>
+                        <tr>
+                            <td><strong>storage/backends/pgvector_backend.py</strong></td>
+                            <td>159</td>
+                            <td>64</td>
+                            <td><span class="coverage-badge medium">60%</span></td>
+                            <td>
+                                <div class="bar-container">
+                                    <div class="bar-fill medium" style="width: 60%"></div>
+                                    <span class="bar-text">60%</span>
+                                </div>
+                            </td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+        
+        <div class="gap-section">
+            <h2 style="color: #f85149; margin-bottom: 1rem;">Critical Coverage Gaps</h2>
+            
+            <div class="gap-card">
+                <h3>run.py — 0% Coverage</h3>
+                <p>All 620 statements untested. Every CLI command (setup, ingest, extract, review, status, slack-setup, github-setup, notion-setup, jira-setup, check-expiry, reextract, export-skills, reset-db, tui) is completely untested. This is by far the biggest gap in the codebase.</p>
+            </div>
+            
+            <div class="gap-card">
+                <h3>ingestion/loader.py — 58% Coverage</h3>
+                <p>Interactive setup flows (Rich console prompts, Progress bars, _click.prompt calls) are mocked out in tests. The actual live API paths inside Progress contexts aren't hit. The loading logic itself is tested, but the UI-heavy paths and error handling within those flows are not.</p>
+            </div>
+            
+            <div class="gap-card">
+                <h3>ingestion/chunker.py — 63% Coverage</h3>
+                <p>Some chunker branches untested: Zendesk article chunking, Google Drive document chunking, Confluence table handling, DocumentChunker semantic split for long PDF pages (>4000 chars), and some edge cases in generic fallback.</p>
+            </div>
+            
+            <div class="gap-card medium-gap">
+                <h3>providers/llm.py — 57% Coverage</h3>
+                <p>complete_json() repair loop partially tested via test_json_repair.py, but the actual litellm.completion() call paths, streaming responses, and error recovery are not covered.</p>
+            </div>
+            
+            <div class="gap-card medium-gap">
+                <h3>providers/embedder.py — 40% Coverage</h3>
+                <p>embed_text() and embed_batch() call LiteLLM — mocked in backend tests but the retry logic, batching edge cases, and failure paths aren't fully covered.</p>
+            </div>
+            
+            <div class="gap-card medium-gap">
+                <h3>engine/graph.py — 54% Coverage</h3>
+                <p>LangGraph pipeline wiring and run_extraction() runner. Individual nodes are tested, but the graph wiring and state transitions between nodes are not tested end-to-end.</p>
+            </div>
+            
+            <div class="gap-card">
+                <h3>engine/nodes/formatter.py — 19% Coverage</h3>
+                <p>Rule formatting node — turns extraction state into YAML-ready output. Completely untested in isolation from the graph.</p>
+            </div>
+            
+            <div class="gap-card">
+                <h3>engine/nodes/retriever.py — 22% Coverage</h3>
+                <p>Vector search retriever — queries the vector store. Not tested end-to-end because it requires a live vector store and embeddings.</p>
+            </div>
+            
+            <div class="gap-card">
+                <h3>output/writer.py — 18% Coverage</h3>
+                <p>YAML save/load/update logic. Only output/schema.py (Pydantic models) is tested — the actual file I/O and directory creation paths are not.</p>
+            </div>
+        </div>
+        
+        <footer>
+            <p>KORE Coverage Report | 114 tests | 65% overall | Generated with pytest-cov</p>
+            <p style="margin-top: 0.5rem; font-size: 0.9rem;">Test suites: 10 | Application modules: 23 | Total statements: 4,652</p>
+        </footer>
+    </div>
+</body>
+</html>

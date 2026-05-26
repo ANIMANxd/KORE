@@ -1,4 +1,5 @@
 import os
+import sys
 import time
 from collections import Counter
 from datetime import datetime, timezone
@@ -22,6 +23,10 @@ from engine.graph import run_extraction
 from engine.reextractor import find_affected_rules, reextract_rule
 from ingestion.chunker import chunk_documents
 from ingestion.loader import load
+from graph import extract_entities, load_graph, save_graph, get_most_connected_entities
+from graph.models import KnowledgeGraph
+from memory.store import build_memory_store
+from memory.decay import decay_sweep, get_freshness_summary
 from output.schema import BusinessRule
 from output.skills_writer import export_skills_json
 from output.writer import load_rules, save_rule
@@ -43,6 +48,16 @@ _VERBOSE = False
 def _debug(msg: str) -> None:
     if _VERBOSE:
         console.print(f"[dim][DEBUG] {msg}[/dim]")
+
+
+def _load_or_create_graph() -> KnowledgeGraph:
+    """Load the persisted knowledge graph or return a fresh one."""
+    return load_graph("graph/knowledge_graph.json")
+
+
+def _save_graph(graph: KnowledgeGraph) -> None:
+    """Persist the knowledge graph to disk."""
+    save_graph(graph, "graph/knowledge_graph.json")
 
 
 # ---------------------------------------------------------------------------
@@ -705,19 +720,28 @@ def jira_setup():
 # ---------------------------------------------------------------------------
 
 @cli.command()
-@click.option("--source", "source_type", type=click.Choice(["slack", "github", "notion", "jira"], case_sensitive=False),
+@click.option("--source", "source_type", type=click.Choice(["slack", "github", "notion", "jira", "teams", "confluence", "linear", "zendesk", "google_drive", "documents"], case_sensitive=False),
               required=True, help="Data source type")
-@click.option("--path", required=False, help="Path to export directory (required for local mode)")
+@click.option("--path", required=False, help="Path to export directory or file (required for local mode)")
 @click.option("--live", is_flag=True, help="Ingest via live API instead of local export")
 def ingest(source_type: str, path: str | None, live: bool):
     """Ingest data: load → chunk → embed → store"""
     start = time.time()
 
-    if source_type in ("github", "notion", "jira"):
+    # Sources that are always live
+    if source_type in ("github", "notion", "jira", "teams", "confluence", "linear", "zendesk", "google_drive"):
         live = True
 
-    if source_type not in ("slack", "github", "notion", "jira"):
-        console.print(f"[red]Source '{source_type}' not yet implemented. Supported: slack, github, notion, jira.[/red]")
+    # Documents is always local (path required)
+    if source_type == "documents":
+        if not path:
+            console.print("[red]--path is required for document ingestion. Example: --path ./company-policies/[/red]")
+            return
+        live = False
+
+    supported = ("slack", "github", "notion", "jira", "teams", "confluence", "linear", "zendesk", "google_drive", "documents")
+    if source_type not in supported:
+        console.print(f"[red]Source '{source_type}' not yet implemented. Supported: {', '.join(supported)}.[/red]")
         return
 
     if live:
@@ -838,6 +862,28 @@ def extract(query: str, save: bool):
                             border_style="red",
                         )
                     )
+
+            # Auto-run entity extraction into knowledge graph
+            if status == "verified":
+                try:
+                    graph = _load_or_create_graph()
+                    new_ents, new_rels = extract_entities(rule, graph)
+                    graph.total_rules_processed += 1
+                    _save_graph(graph)
+                    console.print(
+                        f"[KORE] Graph: +{len(new_ents)} entities, +{len(new_rels)} relationships"
+                    )
+                except Exception as exc:
+                    _debug(f"Graph extraction failed: {exc}")
+
+                # Auto-run memory store rebuild
+                try:
+                    store = build_memory_store()
+                    console.print(
+                        f"[KORE] Memory store rebuilt: {store.entry_count} entries"
+                    )
+                except Exception as exc:
+                    _debug(f"Memory store build failed: {exc}")
         except Exception as exc:
             console.print(f"\n[red]✗ Failed to save rule: {exc}[/red]")
 
@@ -1125,6 +1171,54 @@ def status():
 
 
 # ---------------------------------------------------------------------------
+# graph-stats
+# ---------------------------------------------------------------------------
+
+@cli.command("graph-stats")
+def graph_stats():
+    """Show knowledge graph statistics"""
+    graph = _load_or_create_graph()
+
+    if not graph.entities:
+        console.print("[dim]No graph data yet. Extract and save some rules first.[/dim]")
+        return
+
+    console.print(Panel.fit("Knowledge Graph Stats", style="bold blue"))
+
+    # Summary
+    console.print(f"\n[bold]Overview[/bold]")
+    console.print(f"  Total entities        : [green]{len(graph.entities)}[/green]")
+    console.print(f"  Total relationships   : [green]{len(graph.relationships)}[/green]")
+    console.print(f"  Rules processed       : [cyan]{graph.total_rules_processed}[/cyan]")
+    console.print(f"  Last updated          : [dim]{graph.last_updated.isoformat()}[/dim]")
+
+    # Entities by type
+    entity_type_counts: dict[str, int] = {}
+    for entity in graph.entities.values():
+        entity_type_counts[entity.entity_type] = entity_type_counts.get(entity.entity_type, 0) + 1
+
+    type_table = Table(title="Entities by Type")
+    type_table.add_column("Type", style="magenta")
+    type_table.add_column("Count", style="green", justify="right")
+    for etype, count in sorted(entity_type_counts.items()):
+        type_table.add_row(etype, str(count))
+    console.print()
+    console.print(type_table)
+
+    # Top connected
+    top_connected = get_most_connected_entities(graph, top_n=5)
+    if top_connected:
+        conn_table = Table(title="Top 5 Most Connected")
+        conn_table.add_column("Entity", style="white")
+        conn_table.add_column("Type", style="magenta")
+        conn_table.add_column("Connections", style="cyan", justify="right")
+        for entity, degree in top_connected:
+            conn_table.add_row(entity.name, entity.entity_type, str(degree))
+        console.print()
+        console.print(conn_table)
+
+
+# ---------------------------------------------------------------------------
 # export-skills
 # ---------------------------------------------------------------------------
 
@@ -1147,6 +1241,58 @@ def export_skills(output: str, rules_dir: str):
 
 
 # ---------------------------------------------------------------------------
+# build-memory
+# ---------------------------------------------------------------------------
+
+@cli.command("build-memory")
+@click.option("--rules-dir", default="rules/extracted/", show_default=True, help="Directory containing rule YAML files")
+@click.option("--graph-path", default="graph/knowledge_graph.json", show_default=True, help="Path to knowledge graph JSON")
+@click.option("--output", default="memory/store.json", show_default=True, help="Output memory store JSON path")
+def build_memory(rules_dir: str, graph_path: str, output: str):
+    """Build the agent memory store from rules and graph"""
+    console.print(Panel.fit("Building Memory Store", style="bold blue"))
+
+    try:
+        store = build_memory_store(
+            rules_dir=rules_dir,
+            graph_path=graph_path,
+            output_path=output,
+        )
+        console.print(f"[green]✓ Memory store built: {store.entry_count} entries[/green]")
+        console.print(f"[dim]Saved to {output}[/dim]")
+    except Exception as exc:
+        console.print(f"[red]✗ Build failed: {exc}[/red]")
+
+
+# ---------------------------------------------------------------------------
+# decay-sweep
+# ---------------------------------------------------------------------------
+
+@cli.command("decay-sweep")
+@click.option("--half-life", default=30.0, show_default=True, help="Half-life in days for freshness decay")
+@click.option("--access-boost", default=0.1, show_default=True, help="Access count boost factor")
+@click.option("--store-path", default="memory/store.json", show_default=True, help="Path to memory store JSON")
+def decay_sweep_cmd(half_life: float, access_boost: float, store_path: str):
+    """Run a freshness decay sweep over the memory store"""
+    console.print(Panel.fit("Memory Decay Sweep", style="bold blue"))
+
+    try:
+        updated, store = decay_sweep(
+            store_path=store_path,
+            half_life_days=half_life,
+            access_boost=access_boost,
+        )
+        summary = get_freshness_summary(store)
+        console.print(f"[green]✓ Decay sweep complete. {updated} entries updated.[/green]")
+        console.print(
+            f"[dim]Freshness distribution — "
+            f"High: {summary['high']}  Mid: {summary['mid']}  Low: {summary['low']}[/dim]"
+        )
+    except Exception as exc:
+        console.print(f"[red]✗ Decay sweep failed: {exc}[/red]")
+
+
+# ---------------------------------------------------------------------------
 # reset-db
 # ---------------------------------------------------------------------------
 
@@ -1165,6 +1311,111 @@ def reset_db():
         console.print("[green]✓ Vector store reset complete.[/green]")
     except Exception as exc:
         console.print(f"[red]✗ Failed: {exc}[/red]")
+
+
+# ---------------------------------------------------------------------------
+# mcp-server
+# ---------------------------------------------------------------------------
+
+@cli.command("mcp-server")
+@click.option("--port", default=3333, show_default=True, help="Port to bind the MCP server")
+@click.option("--host", default="127.0.0.1", show_default=True, help="Host to bind the MCP server")
+def mcp_server(port: int, host: str):
+    """Start the local MCP server for agent integration"""
+    console.print(Panel.fit("KORE MCP Server", style="bold blue"))
+    console.print(f"[green]KORE MCP server running at http://{host}:{port}[/green]")
+    console.print()
+    console.print("[bold]MCP Config Snippet[/bold]")
+    console.print("""
+{
+  "mcpServers": {
+    "kore": {
+      "url": "http://HOST:PORT/mcp",
+      "env": {}
+    }
+  }
+}
+""".replace("HOST", host).replace("PORT", str(port)))
+    console.print("[dim]Add this to your agent's MCP config (e.g. Claude Desktop, Claude Code).[/dim]")
+    console.print()
+
+    # Load the server module dynamically to avoid import conflicts
+    # with the installed 'mcp' SDK package.
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("kore_mcp", "mcp/server.py")
+    kore_mcp = importlib.util.module_from_spec(spec)
+    sys.modules["kore_mcp"] = kore_mcp
+    spec.loader.exec_module(kore_mcp)
+    kore_mcp.start_server(host=host, port=port)
+
+
+# ---------------------------------------------------------------------------
+# setup-claude-code
+# ---------------------------------------------------------------------------
+
+@cli.command("setup-claude-code")
+@click.option("--port", default=3333, show_default=True, help="MCP server port")
+def setup_claude_code(port: int):
+    """Configure Claude Code to use KORE as a pre-flight compliance layer"""
+    console.print(Panel.fit("Setup Claude Code Integration", style="bold blue"))
+
+    from integrations.claude_code import setup_claude_code as do_setup
+
+    success, message = do_setup(mcp_port=port)
+    if success:
+        console.print(f"[green]✓ KORE connected to Claude Code.[/green]")
+        console.print(f"[dim]Settings written to {message}[/dim]")
+        console.print("[yellow]Restart Claude Code to activate.[/yellow]")
+    else:
+        console.print(f"[red]✗ Setup failed: {message}[/red]")
+
+
+# ---------------------------------------------------------------------------
+# export-context
+# ---------------------------------------------------------------------------
+
+@cli.command("export-context")
+@click.option("--domain", required=True, help="Task domain to query (e.g. 'refund policy')")
+@click.option("--format", "output_format", type=click.Choice(["markdown", "xml", "plain"], case_sensitive=False), default="markdown", show_default=True, help="Output format")
+@click.option("--output", default="kore_context.md", show_default=True, help="Output file path")
+@click.option("--max-tokens", default=1500, show_default=True, help="Approximate token budget")
+def export_context(domain: str, output_format: str, output: str, max_tokens: int):
+    """Export a company knowledge context block for agent system prompts"""
+    console.print(Panel.fit("Export Company Context", style="bold blue"))
+
+    from integrations.context_injector import export_context_file
+
+    try:
+        path = export_context_file(
+            task_domain=domain,
+            output_path=output,
+            output_format=output_format,  # type: ignore[arg-type]
+            max_tokens=max_tokens,
+        )
+        console.print(f"[green]✓ Context exported to {path}[/green]")
+        console.print()
+        console.print("[bold]Instructions[/bold]")
+        console.print("Add this file to your agent's system prompt to give it company knowledge.")
+        console.print(f"[dim]Example: paste the contents of {path} at the top of your system prompt.[/dim]")
+    except Exception as exc:
+        console.print(f"[red]✗ Export failed: {exc}[/red]")
+
+
+# ---------------------------------------------------------------------------
+# tui
+# ---------------------------------------------------------------------------
+
+@cli.command()
+def tui():
+    """Launch the Textual terminal user interface"""
+    try:
+        from ui.tui import KoreApp
+        app = KoreApp()
+        app.run()
+    except ImportError as exc:
+        console.print("[red]TUI requires 'textual'. Install it with:[/red]")
+        console.print("  [bold]pip install textual[/bold]")
+        console.print(f"[dim]{exc}[/dim]")
 
 
 # ---------------------------------------------------------------------------
